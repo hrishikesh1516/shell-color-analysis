@@ -4,7 +4,7 @@ Advanced Adaptive Color Detection Framework for Shell Organisms (Bivalves)
 This program performs comprehensive color identification and pattern analysis
 on shell organism images using multiple clustering strategies:
 
-1. Automated K Selection  - Silhouette score, elbow method, Davies-Bouldin index
+1. Automated K Selection   - Silhouette score, elbow method, Davies-Bouldin index
 2. Hierarchical Clustering - Agglomerative with adaptive distance thresholds
 3. DBSCAN                  - Density-based clustering for rare color detection
 4. Adaptive Merge Logic    - Percentile-based threshold computation
@@ -13,11 +13,30 @@ on shell organism images using multiple clustering strategies:
 7. Enhanced Visualization  - Dashboard with clustering metrics and dendrograms
 8. Comprehensive Reporting - CSV and JSON export with detailed statistics
 
-Usage:
-    python shell_color_analysis.py
+Usage
+-----
+Analyze all images in a folder (all clustering methods):
     python shell_color_analysis.py --folder /path/to/images
-    python shell_color_analysis.py --folder /path/to/images --method all
-    python shell_color_analysis.py --train --folder /path/to/labeled_images
+
+Select a specific clustering method:
+    python shell_color_analysis.py --folder /path/to/images --method kmeans
+    python shell_color_analysis.py --folder /path/to/images --method hierarchical
+    python shell_color_analysis.py --folder /path/to/images --method dbscan
+
+Adjust the K-Means search range:
+    python shell_color_analysis.py --folder /path/to/images --k-min 3 --k-max 20
+
+Use a fixed CIELAB merge threshold instead of the adaptive one:
+    python shell_color_analysis.py --folder /path/to/images --merge-threshold 15.0
+
+Save results without opening interactive plot windows:
+    python shell_color_analysis.py --folder /path/to/images --no-show
+
+Train the supervised Random Forest classifier (no pre-labeled data needed):
+    python shell_color_analysis.py --folder /path/to/training_images --train
+
+See COMMANDS.md for a complete quick-reference and PARAMETER_GUIDE.md for
+detailed parameter tuning guidance.
 """
 
 import argparse
@@ -806,17 +825,54 @@ def train_color_classifier(labeled_data, save_path="color_classifier.pkl"):
     """
     Train a Random Forest color classifier on labeled pixel data.
 
+    The classifier maps CIELAB color features to color-name labels.  It can be
+    trained without any hand-labeled images: run the clustering pipeline first
+    to discover color groups automatically, then pass those groups as
+    ``labeled_data``.
+
     Parameters
     ----------
     labeled_data : list of (np.ndarray, str)
-        List of (pixel_array, label_string) tuples.
-    save_path : str
-        Path to save the trained classifier.
+        List of ``(pixel_array, label_string)`` tuples.  Each ``pixel_array``
+        must have shape ``(N, 3)`` in **RGB** order.  ``label_string`` is the
+        human-readable color name (e.g. ``"purple"``, ``"brown"``, ``"white"``).
+
+        Example (unsupervised labels from clustering)::
+
+            labeled_data = [
+                (purple_cluster_pixels, "purple"),
+                (brown_cluster_pixels,  "brown"),
+                (white_cluster_pixels,  "white"),
+            ]
+
+        Example (hand-labeled pixel arrays)::
+
+            labeled_data = [
+                (np.array([[128, 0, 128], ...]), "purple"),
+                (np.array([[139, 90,  43], ...]), "brown"),
+            ]
+
+    save_path : str, optional
+        File path for the saved classifier (``pickle`` format).
+        Default: ``"color_classifier.pkl"``.
 
     Returns
     -------
-    RandomForestClassifier
-        Trained classifier.
+    sklearn.ensemble.RandomForestClassifier
+        The trained classifier, also persisted to ``save_path``.
+
+    Notes
+    -----
+    - Each RGB pixel is converted to CIELAB before training so that the model
+      operates in a perceptually uniform color space.
+    - The Random Forest uses 100 estimators and all available CPU cores
+      (``n_jobs=-1``).
+    - After training, apply the classifier by loading it with
+      :func:`load_color_classifier` and calling ``clf.predict(lab_pixels)``.
+
+    See Also
+    --------
+    load_color_classifier : Load a previously saved classifier from disk.
     """
     logger.info("Training supervised color classifier...")
     X, y = [], []
@@ -1312,44 +1368,106 @@ def process_images(folder_path, config=None):
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Advanced Adaptive Color Detection Framework for Shell Organisms"
+        description=(
+            "Advanced Adaptive Color Detection Framework for Shell Organisms. "
+            "Runs K-Means, Hierarchical, and/or DBSCAN clustering on shell images "
+            "and optionally trains a supervised Random Forest color classifier. "
+            "See COMMANDS.md for a quick-reference and PARAMETER_GUIDE.md for "
+            "detailed parameter tuning guidance."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  Analyze with all methods (default):\n"
+            "    python shell_color_analysis.py --folder images --no-show\n\n"
+            "  Analyze with K-Means only, custom K range:\n"
+            "    python shell_color_analysis.py --folder images --method kmeans "
+            "--k-min 3 --k-max 15 --no-show\n\n"
+            "  Train the classifier on representative images (no labels needed):\n"
+            "    python shell_color_analysis.py --folder training_data --train\n\n"
+            "  Apply the trained classifier to new images:\n"
+            "    python shell_color_analysis.py --folder trial --no-show\n"
+        ),
     )
     parser.add_argument(
         "--folder", type=str, default=DEFAULT_CONFIG["INPUT_FOLDER"],
-        help="Path to folder containing shell images (default: ./images)"
+        help=(
+            "Path to folder containing shell images to analyze. "
+            "All .jpg, .jpeg, and .png files in the folder are processed. "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--output", type=str, default=DEFAULT_CONFIG["OUTPUT_FOLDER"],
-        help="Path to output folder for results (default: ./output)"
+        help=(
+            "Path to output folder where result files (CSV, JSON, PNG) are written. "
+            "Created automatically if it does not exist. "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--method", type=str, default="all",
         choices=["kmeans", "hierarchical", "dbscan", "all"],
-        help="Clustering method(s) to use (default: all)"
+        help=(
+            "Clustering method(s) to use. "
+            "'kmeans' selects the optimal K automatically; "
+            "'hierarchical' uses agglomerative clustering and produces a dendrogram; "
+            "'dbscan' detects dominant and rare colors without a pre-specified K; "
+            "'all' runs all three and writes a combined JSON comparison report. "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--k-min", type=int, default=DEFAULT_CONFIG["NUM_CLUSTERS_MIN"],
-        help="Minimum K for K-Means search (default: 5)"
+        help=(
+            "Minimum number of clusters (K) for the K-Means search range. "
+            "Increase if you know the shell has at least N distinct color zones. "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--k-max", type=int, default=DEFAULT_CONFIG["NUM_CLUSTERS_MAX"],
-        help="Maximum K for K-Means search (default: 30)"
+        help=(
+            "Maximum number of clusters (K) for the K-Means search range. "
+            "Reduce to speed up analysis on simple images; increase for complex, "
+            "multi-color patterns. "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--merge-threshold", type=float, default=None,
-        help="Fixed CIELAB merge threshold (default: adaptive from data)"
+        help=(
+            "Fixed CIELAB distance threshold for merging similar color clusters. "
+            "When omitted the threshold is computed adaptively from the percentile "
+            "of pairwise cluster-center distances (recommended). "
+            "Lower values keep more distinct clusters; higher values merge more "
+            "aggressively (e.g. 10 = light merging, 20 = aggressive). "
+            "(default: adaptive)"
+        ),
     )
     parser.add_argument(
         "--no-show", action="store_true",
-        help="Do not display plots interactively"
+        help=(
+            "Do not open interactive matplotlib windows. "
+            "Use this flag in server / batch environments or when running without a display."
+        ),
     )
     parser.add_argument(
         "--no-save", action="store_true",
-        help="Do not save figures to output folder"
+        help=(
+            "Do not write any output files (PNG, CSV, JSON) to disk. "
+            "Useful for quick exploratory runs."
+        ),
     )
     parser.add_argument(
         "--train", action="store_true",
-        help="Train supervised classifier (requires labeled data)"
+        help=(
+            "Train the supervised Random Forest color classifier on the images in "
+            "--folder. No manual labeling is required: clustering automatically "
+            "discovers color groups which are used as training labels. "
+            "The trained model is saved to the path set by CLASSIFIER_PATH in "
+            "DEFAULT_CONFIG (default: color_classifier.pkl)."
+        ),
     )
     return parser.parse_args()
 
