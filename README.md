@@ -1,21 +1,21 @@
 # Shell Color Analysis
 
 Advanced adaptive color detection framework for shell organisms (bivalves) using
-multiple unsupervised and supervised clustering strategies.
+scale-independent image normalisation and unsupervised clustering with automatic
+parameter optimisation.
 
 ## Features
 
 - **Automated K Selection** – Silhouette score, elbow method, and Davies-Bouldin index determine the optimal cluster count automatically
 - **Hierarchical Clustering** – Agglomerative clustering with adaptive distance thresholds and dendrogram visualization
-- **DBSCAN Integration** – Density-based clustering detects both dominant and rare colors without pre-specifying K
 - **Adaptive Merge Logic** – Percentile-based analysis computes merge thresholds from the data distribution
-- **Multiple Method Comparison** – K-Means, Hierarchical, and DBSCAN run together with side-by-side performance metrics
-- **Supervised Classifier** – Optional Random Forest color classifier for standardized detection across a dataset
-- **Enhanced Visualization** – Dashboard with clustering metrics, dendrograms, optimization curves, and method comparisons
-- **Comprehensive Reporting** – Detailed console output plus CSV and JSON export including area statistics and pattern analysis
+- **Scale-Independent Analysis** – All images are normalized to a 1000×1000 canvas before analysis so that color-coverage percentages are directly comparable regardless of the original image resolution
+- **Parameter Training** – Optimize K range, merge percentile, and hierarchical distance percentile automatically from sample images (no manual labels needed)
+- **Trained vs. Default Comparison** – Run both parameter sets side-by-side to evaluate training improvement
+- **Enhanced Visualization** – Dashboard with clustering metrics, dendrograms, and optimization curves
+- **Comprehensive Reporting** – Detailed console output plus CSV and JSON export with color percentages
 - **Background Removal** – Automatic shell isolation using `rembg`
 - **Glare Detection** – Inpainting-based glare removal before color analysis
-- **Pattern Analysis** – Geometric analysis of secondary color patterns (stripes, spots, patches)
 - **XKCD 949-Color Dictionary** – Perceptual color naming using CIELAB distance
 
 ## Installation
@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Basic – Analyze all images in a folder
+### Basic – Analyse all images in a folder
 
 ```bash
 # Linux / macOS
@@ -44,7 +44,7 @@ python shell_color_analysis.py --folder "C:\Users\YourName\PythonProject\images"
 
 ### Clustering Methods
 
-All three methods can be run individually or together.
+Both methods can be run individually or together.
 
 #### K-Means (optimal K selected automatically)
 ```bash
@@ -56,12 +56,7 @@ python shell_color_analysis.py --folder /path/to/images --method kmeans
 python shell_color_analysis.py --folder /path/to/images --method hierarchical
 ```
 
-#### DBSCAN (density-based, detects rare colors)
-```bash
-python shell_color_analysis.py --folder /path/to/images --method dbscan
-```
-
-#### All methods together (default – recommended)
+#### Both methods together (default – recommended)
 ```bash
 python shell_color_analysis.py --folder /path/to/images --method all
 ```
@@ -74,7 +69,7 @@ Control the minimum and maximum number of clusters the optimizer searches over:
 
 ```bash
 python shell_color_analysis.py --folder /path/to/images --k-min 3 --k-max 15
-python shell_color_analysis.py --folder /path/to/images --k-min 5 --k-max 25
+python shell_color_analysis.py --folder /path/to/images --k-min 5 --k-max 20
 ```
 
 ---
@@ -111,76 +106,120 @@ python shell_color_analysis.py --folder /path/to/images --output /path/to/result
 
 ---
 
+### Scale-Independent Image Analysis
+
+All images are automatically normalized to a **1000×1000 pixel canvas** before any
+analysis takes place.  This means:
+
+- Images of any resolution (500 px or 5000 px) produce **identical percentage outputs**
+- No camera calibration or `PIXELS_PER_UNIT` value is required
+- Results are directly comparable across your entire dataset
+
+```
+Input: any resolution (e.g. 3000×2000 px)
+        ↓
+Resize to fit 1000×1000 canvas (aspect ratio preserved, padded with black)
+        ↓
+All analysis runs on the 1000×1000 image
+        ↓
+Output: color percentages (scale-independent ✓)
+```
+
+---
+
+### Training Optimized Clustering Parameters
+
+The framework can learn the best K range, merge percentile, and hierarchical distance
+percentile for **your** shells by analysing a folder of training images.  No manual
+labeling is required.
+
+```bash
+# Train on sample images
+python shell_color_analysis.py --folder training_data --train
+
+# Windows
+python shell_color_analysis.py --folder "C:\Users\YourName\PythonProject\training_data" --train
+```
+
+The optimized parameters are saved to `trained_params.pkl` (path configurable via
+`TRAINED_PARAMS_PATH` in `DEFAULT_CONFIG`).
+
+**What gets optimized:**
+
+| Parameter | What it controls |
+|-----------|-----------------|
+| `NUM_CLUSTERS_MIN` | Lower bound of the K search |
+| `NUM_CLUSTERS_MAX` | Upper bound of the K search |
+| `COLOR_MERGE_PERCENTILE` | Merge aggressiveness |
+| `HIERARCHICAL_DISTANCE_PERCENTILE` | Hierarchical cut height |
+| `optimal_merge_threshold` | Fixed merge distance derived from training |
+
+---
+
+### Using Trained Parameters for Analysis
+
+```bash
+# Analyse new images with the trained parameter set
+python shell_color_analysis.py --folder trial --use-trained-params --no-show
+```
+
+---
+
+### Comparing Trained vs. Default Results
+
+Run both parameter sets back-to-back and compare their outputs:
+
+```bash
+python shell_color_analysis.py --folder trial --compare-trained --no-show
+```
+
+This produces two sets of output files (labelled `default` and `trained`) so you can
+evaluate the improvement the training step provides.
+
+---
+
 ### Complete Step-by-Step Workflow
 
 ```
 Step 1 – Prepare your images
 ─────────────────────────────
 project/
-├── training_data/        ← Images used for training the classifier
-│   ├── shell_01.jpg
+├── training_data/        ← Representative images for parameter optimisation
+│   ├── shell_01.jpg      (any resolution – will be normalized automatically)
 │   ├── shell_02.jpg
 │   └── ...
-├── trial/                ← New images to analyze
+├── trial/                ← New images to analyse
 │   └── purple_shell.jpg
 └── shell_color_analysis.py
 
-Step 2 – Analyze new images with all clustering methods
-────────────────────────────────────────────────────────
-python shell_color_analysis.py --folder trial --method all --no-show
-
-Step 3 – Train the classifier on representative images (no labels needed)
-──────────────────────────────────────────────────────────────────────────
+Step 2 – Train clustering parameters on representative images
+──────────────────────────────────────────────────────────────
 python shell_color_analysis.py --folder training_data --train
 
-Step 4 – Evaluate training results
-────────────────────────────────────
-python shell_color_analysis.py --folder training_data --train --no-show
+Step 3 – Analyse new images with trained parameters
+─────────────────────────────────────────────────────
+python shell_color_analysis.py --folder trial --use-trained-params --no-show
 
-Step 5 – Apply the trained model to all new images
-────────────────────────────────────────────────────
-python shell_color_analysis.py --folder trial --no-show
+Step 4 – Compare trained vs. default (optional)
+────────────────────────────────────────────────
+python shell_color_analysis.py --folder trial --compare-trained --no-show
 ```
 
 ---
 
-### Scale-Independent Image Analysis
+### Output Files
 
-The framework converts pixel areas to physical units using the `PIXELS_PER_UNIT` and
-`UNIT_NAME` configuration values.  Adjust these in `DEFAULT_CONFIG` (or pass the
-corresponding values) to match your camera / microscope calibration:
-
-```python
-# In DEFAULT_CONFIG:
-"PIXELS_PER_UNIT": 176.0454,   # pixels per cm (calibrate to your setup)
-"UNIT_NAME": "cm",             # reported unit label
-```
-
-All area outputs in the CSV / JSON reports are then expressed in the chosen unit
-regardless of image resolution.
-
----
-
-### Model Comparison
-
-Running `--method all` automatically compares K-Means, Hierarchical, and DBSCAN
-side by side and writes a combined JSON report:
-
-```bash
-python shell_color_analysis.py --folder /path/to/images --method all --no-show
-```
-
-Output files produced:
+Running `--method all` produces:
 
 | File | Description |
 |------|-------------|
 | `dashboard_<timestamp>.png` | Multi-panel visualization dashboard |
 | `optimization_curves_<timestamp>.png` | K-selection optimization curves (K-Means only) |
 | `dendrogram_<timestamp>.png` | Hierarchical clustering dendrogram |
-| `results_kmeans_<timestamp>.csv` | K-Means color table |
-| `results_hierarchical_<timestamp>.csv` | Hierarchical color table |
-| `results_dbscan_<timestamp>.csv` | DBSCAN color table |
-| `results_all_<timestamp>.json` | All methods combined (JSON) |
+| `results_kmeans_<timestamp>.csv` | K-Means color table (percentages) |
+| `results_hierarchical_<timestamp>.csv` | Hierarchical color table (percentages) |
+| `results_all_<timestamp>.json` | Both methods combined (JSON) |
+| `trained_params.pkl` | Optimized parameters (after `--train`) |
 
 ---
 
@@ -188,99 +227,30 @@ Output files produced:
 
 ```
 usage: shell_color_analysis.py [-h] [--folder FOLDER] [--output OUTPUT]
-                                [--method {kmeans,hierarchical,dbscan,all}]
+                                [--method {kmeans,hierarchical,all}]
                                 [--k-min K_MIN] [--k-max K_MAX]
                                 [--merge-threshold MERGE_THRESHOLD]
-                                [--no-show] [--no-save] [--train]
+                                [--no-show] [--no-save]
+                                [--train] [--use-trained-params]
+                                [--compare-trained]
 
 options:
-  -h, --help            Show this help message and exit
-  --folder FOLDER       Input folder containing shell images (default: ./images)
-  --output OUTPUT       Output folder for results (default: ./output)
-  --method METHOD       Clustering method: kmeans | hierarchical | dbscan | all
-                        (default: all)
-  --k-min K_MIN         Minimum K for K-Means cluster search (default: 5)
-  --k-max K_MAX         Maximum K for K-Means cluster search (default: 30)
-  --merge-threshold T   Fixed CIELAB merge threshold; omit for adaptive (default: adaptive)
-  --no-show             Do not open interactive plot windows
-  --no-save             Do not save output files to disk
-  --train               Train the supervised Random Forest color classifier
+  -h, --help                Show this help message and exit
+  --folder FOLDER           Input folder containing shell images (default: ./images)
+  --output OUTPUT           Output folder for results (default: ./output)
+  --method METHOD           Clustering method: kmeans | hierarchical | all (default: all)
+  --k-min K_MIN             Minimum K for K-Means cluster search (default: 3)
+  --k-max K_MAX             Maximum K for K-Means cluster search (default: 15)
+  --merge-threshold T       Fixed CIELAB merge threshold; omit for adaptive (default: adaptive)
+  --no-show                 Do not open interactive plot windows
+  --no-save                 Do not save output files to disk
+  --train                   Train clustering parameters on --folder images
+  --use-trained-params      Load trained parameters from trained_params.pkl
+  --compare-trained         Run both default and trained parameters and compare
 ```
 
 > See [COMMANDS.md](COMMANDS.md) for a full quick-reference card and
 > [PARAMETER_GUIDE.md](PARAMETER_GUIDE.md) for detailed parameter tuning guidance.
-
----
-
-## Training the Supervised Classifier
-
-### How It Works (No Manual Labels Needed)
-
-The system uses an **unsupervised-to-supervised hybrid** approach.  You supply a
-folder of representative shell images — **no manual pixel marking required**.  The
-clustering algorithms automatically detect color groups, which then serve as labels
-for training the Random Forest classifier.
-
-```
-Your Training Images
-        ↓
-Automatic Color Detection (Clustering)
-├── K-Means  – finds dominant color clusters
-├── Hierarchical – captures color relationships
-└── DBSCAN   – catches rare / subtle colors
-        ↓
-System Automatically Labels Clusters
-├── "This cluster = Purple"
-├── "This cluster = Pink"
-└── "This cluster = Orange"
-        ↓
-Random Forest Classifier Trains on CIELAB Features
-        ↓
-Model saved → color_classifier.pkl  ✓
-```
-
-### Training Without Pre-Labeled Images
-
-```bash
-# Linux / macOS
-python shell_color_analysis.py --folder training_data --train
-
-# Windows
-python shell_color_analysis.py --folder "C:\Users\YourName\PythonProject\training_data" --train
-```
-
-Aim for **5–10 diverse images** covering:
-- Different species (bivalves and gastropods)
-- Different dominant colors (purple, brown, orange, white, etc.)
-- Different patterns (solid, striped, spotted)
-- Different lighting conditions
-
-### Training With Labeled Data (Advanced)
-
-If you already have hand-labeled pixel arrays, you can call the training function
-directly from Python:
-
-```python
-from shell_color_analysis import train_color_classifier
-import numpy as np
-
-# labeled_data is a list of (pixel_array, label_string) tuples
-labeled_data = [
-    (purple_pixel_array, "purple"),   # shape (N, 3) in RGB
-    (brown_pixel_array,  "brown"),
-    (white_pixel_array,  "white"),
-    # ...
-]
-clf = train_color_classifier(labeled_data, save_path="color_classifier.pkl")
-```
-
-### Applying the Trained Classifier
-
-After training, run the normal analysis — the saved classifier is loaded automatically:
-
-```bash
-python shell_color_analysis.py --folder trial --no-show
-```
 
 ---
 
@@ -290,8 +260,8 @@ python shell_color_analysis.py --folder trial --no-show
 
 | Parameter | Default | When to Increase | When to Decrease |
 |-----------|---------|-----------------|-----------------|
-| `K_MIN` | `5` | Always want at least N colors | Images are very simple |
-| `K_MAX` | `30` | Shells have many subtle colors | Analysis is too slow |
+| `K_MIN` | `3` | Always want at least N colors | Images are very simple |
+| `K_MAX` | `15` | Shells have many subtle colors | Analysis is too slow |
 | `COLOR_MERGE_THRESHOLD` | adaptive | Colors are over-split | Colors are merged too aggressively |
 | `HIERARCHICAL_DISTANCE_PERCENTILE` | `85` | Want fewer, broader clusters | Want finer color distinctions |
 
@@ -301,14 +271,6 @@ Leave `COLOR_MERGE_THRESHOLD` as `None` (adaptive) in most cases.  The program
 computes the threshold from the 30th percentile of pairwise cluster-center distances,
 which scales automatically with the color complexity of each image.  Only set a fixed
 value when you need strictly reproducible thresholds across a batch.
-
-```bash
-# Adaptive (default – scales per image)
-python shell_color_analysis.py --folder images
-
-# Fixed threshold of 15 CIELAB units
-python shell_color_analysis.py --folder images --merge-threshold 15.0
-```
 
 See [PARAMETER_GUIDE.md](PARAMETER_GUIDE.md) for a complete parameter reference with
 recommended ranges, performance tips, and troubleshooting examples.
@@ -324,19 +286,18 @@ All parameters can be tuned in the `DEFAULT_CONFIG` dictionary at the top of
 |-----------|---------|-------------|
 | `INPUT_FOLDER` | `./images` | Folder containing shell images |
 | `OUTPUT_FOLDER` | `./output` | Folder for output files |
+| `STANDARD_CANVAS_SIZE` | `1000` | Normalized canvas size (pixels) |
 | `CLUSTERING_METHOD` | `all` | Method(s) to run |
-| `NUM_CLUSTERS_MIN` | `5` | Minimum K for K-Means search |
-| `NUM_CLUSTERS_MAX` | `30` | Maximum K for K-Means search |
+| `NUM_CLUSTERS_MIN` | `3` | Minimum K for K-Means search |
+| `NUM_CLUSTERS_MAX` | `15` | Maximum K for K-Means search |
 | `COLOR_MERGE_THRESHOLD` | `None` (adaptive) | Fixed CIELAB merge distance |
 | `COLOR_MERGE_PERCENTILE` | `30` | Percentile for adaptive merge threshold |
 | `HIERARCHICAL_DISTANCE_PERCENTILE` | `85` | Percentile for hierarchical cut height |
-| `DBSCAN_EPS_PERCENTILE` | `10` | Percentile of distances for DBSCAN eps |
-| `DBSCAN_MIN_SAMPLES_FRACTION` | `0.002` | Fraction of pixels for min_samples |
 | `GLARE_THRESHOLD` | `245` | V-channel threshold for glare removal |
 | `MIN_COLOR_BRIGHTNESS` | `40` | Minimum brightness for pigment pixels |
 | `WHITE_SENSITIVITY` | `50` | Saturation below which pixel is "white" |
 | `WHITE_BRIGHTNESS` | `150` | Brightness above which pixel is "white" |
-| `PIXELS_PER_UNIT` | `176.0454` | Scale for area calculation (pixels/cm) |
+| `TRAINED_PARAMS_PATH` | `trained_params.pkl` | Path for saving/loading trained params |
 
 ---
 
@@ -346,23 +307,23 @@ All parameters can be tuned in the `DEFAULT_CONFIG` dictionary at the top of
 REM Open Command Prompt and navigate to project folder
 cd "C:\Users\YourName\PythonProject"
 
-REM Analyze with all methods
+REM Analyse with both methods
 python shell_color_analysis.py --folder trial --method all --no-show
 
-REM Analyze with K-Means only
+REM Analyse with K-Means only
 python shell_color_analysis.py --folder trial --method kmeans --no-show
 
-REM Analyze with Hierarchical only
+REM Analyse with Hierarchical only
 python shell_color_analysis.py --folder trial --method hierarchical --no-show
 
-REM Analyze with DBSCAN only
-python shell_color_analysis.py --folder trial --method dbscan --no-show
-
-REM Train the classifier on representative images
+REM Train clustering parameters on representative images
 python shell_color_analysis.py --folder training_data --train
 
-REM Apply the trained classifier to new images
-python shell_color_analysis.py --folder trial --no-show
+REM Analyse new images with trained parameters
+python shell_color_analysis.py --folder trial --use-trained-params --no-show
+
+REM Compare trained vs. default results
+python shell_color_analysis.py --folder trial --compare-trained --no-show
 
 REM Adjust K search range
 python shell_color_analysis.py --folder trial --k-min 3 --k-max 15 --no-show
@@ -375,11 +336,11 @@ python shell_color_analysis.py --folder trial --merge-threshold 15.0 --no-show
 
 ## References and Best Practices
 
-- Use **at least 5 training images** covering the full range of colors in your dataset.
+- Use **at least 5–10 training images** covering the full range of colors in your dataset.
+- Images can be **any resolution** – the 1000×1000 normalisation is applied automatically.
 - Run `--method all` first to see which clustering method performs best for your images.
 - Use `--no-show` in automated or server environments to avoid GUI dependencies.
 - Keep `COLOR_MERGE_THRESHOLD` adaptive unless you need perfectly reproducible thresholds.
-- Calibrate `PIXELS_PER_UNIT` to your camera setup for accurate area measurements.
 - Consult [COMMANDS.md](COMMANDS.md) for a condensed command reference.
 - Consult [PARAMETER_GUIDE.md](PARAMETER_GUIDE.md) for detailed parameter tuning.
 
@@ -388,7 +349,7 @@ python shell_color_analysis.py --folder trial --merge-threshold 15.0 --no-show
 ## Dependencies
 
 - [OpenCV](https://opencv.org/) – Image processing and color space conversions
-- [scikit-learn](https://scikit-learn.org/) – KMeans, AgglomerativeClustering, DBSCAN, RandomForest, metrics
+- [scikit-learn](https://scikit-learn.org/) – KMeans, AgglomerativeClustering, RandomForest, metrics
 - [SciPy](https://scipy.org/) – Hierarchical linkage and dendrogram
 - [rembg](https://github.com/danielgatis/rembg) – Background removal
 - [Matplotlib](https://matplotlib.org/) – Visualization

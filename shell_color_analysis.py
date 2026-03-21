@@ -1,27 +1,26 @@
 """
 Advanced Adaptive Color Detection Framework for Shell Organisms (Bivalves)
 ==========================================================================
-This program performs comprehensive color identification and pattern analysis
-on shell organism images using multiple clustering strategies:
+This program performs comprehensive color identification on shell organism
+images using two clustering strategies:
 
 1. Automated K Selection   - Silhouette score, elbow method, Davies-Bouldin index
 2. Hierarchical Clustering - Agglomerative with adaptive distance thresholds
-3. DBSCAN                  - Density-based clustering for rare color detection
-4. Adaptive Merge Logic    - Percentile-based threshold computation
+3. Adaptive Merge Logic    - Percentile-based threshold computation
+4. Scale-Independent Analysis - All images normalized to 1000×1000 before analysis
 5. Multiple Method Comparison - Side-by-side performance metrics
-6. Supervised Classifier   - Optional ML-based color classifier training
+6. Parameter Training      - Optimize K range and merge thresholds from sample images
 7. Enhanced Visualization  - Dashboard with clustering metrics and dendrograms
 8. Comprehensive Reporting - CSV and JSON export with detailed statistics
 
 Usage
 -----
-Analyze all images in a folder (all clustering methods):
+Analyze all images in a folder (both clustering methods):
     python shell_color_analysis.py --folder /path/to/images
 
 Select a specific clustering method:
     python shell_color_analysis.py --folder /path/to/images --method kmeans
     python shell_color_analysis.py --folder /path/to/images --method hierarchical
-    python shell_color_analysis.py --folder /path/to/images --method dbscan
 
 Adjust the K-Means search range:
     python shell_color_analysis.py --folder /path/to/images --k-min 3 --k-max 20
@@ -32,8 +31,14 @@ Use a fixed CIELAB merge threshold instead of the adaptive one:
 Save results without opening interactive plot windows:
     python shell_color_analysis.py --folder /path/to/images --no-show
 
-Train the supervised Random Forest classifier (no pre-labeled data needed):
+Train on sample images to optimize clustering parameters:
     python shell_color_analysis.py --folder /path/to/training_images --train
+
+Run analysis with trained parameters:
+    python shell_color_analysis.py --folder /path/to/images --use-trained-params
+
+Compare trained-parameter results with default results:
+    python shell_color_analysis.py --folder /path/to/images --compare-trained
 
 See COMMANDS.md for a complete quick-reference and PARAMETER_GUIDE.md for
 detailed parameter tuning guidance.
@@ -59,10 +64,9 @@ import numpy as np
 from PIL import Image
 from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
 from scipy.spatial.distance import pdist
-from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
+from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import silhouette_score, davies_bouldin_score
-from sklearn.preprocessing import StandardScaler
 
 try:
     from rembg import remove as rembg_remove
@@ -92,16 +96,19 @@ DEFAULT_CONFIG = {
     # --- Input/Output ---
     "INPUT_FOLDER": r"./images",
     "OUTPUT_FOLDER": r"./output",
-    "PIXELS_PER_UNIT": 176.0454,
-    "UNIT_NAME": "cm",
+
+    # --- Scale-Independent Normalisation ---
+    # All images are resized to a standard canvas before analysis so that
+    # color-coverage percentages are comparable regardless of input resolution.
+    "STANDARD_CANVAS_SIZE": 1000,  # pixels (width and height of normalized canvas)
 
     # --- Clustering Method ---
-    # Options: "kmeans", "hierarchical", "dbscan", "all"
+    # Options: "kmeans", "hierarchical", "all"
     "CLUSTERING_METHOD": "all",
 
     # --- K-Means Settings ---
-    "NUM_CLUSTERS_MIN": 5,
-    "NUM_CLUSTERS_MAX": 30,
+    "NUM_CLUSTERS_MIN": 3,
+    "NUM_CLUSTERS_MAX": 15,
 
     # --- Color Merge Settings ---
     # If None, threshold is computed adaptively from data distribution
@@ -111,10 +118,6 @@ DEFAULT_CONFIG = {
     # --- Hierarchical Clustering ---
     "HIERARCHICAL_DISTANCE_PERCENTILE": 85,  # Percentile for adaptive distance threshold
 
-    # --- DBSCAN Settings ---
-    "DBSCAN_EPS_PERCENTILE": 10,  # Percentile of pairwise distances for eps
-    "DBSCAN_MIN_SAMPLES_FRACTION": 0.002,  # Fraction of total pixels
-
     # --- Glare & Shadow ---
     "GLARE_THRESHOLD": 245,
     "MIN_COLOR_BRIGHTNESS": 40,
@@ -122,6 +125,9 @@ DEFAULT_CONFIG = {
     # --- White Detection ---
     "WHITE_SENSITIVITY": 50,
     "WHITE_BRIGHTNESS": 150,
+
+    # --- Trained Parameters ---
+    "TRAINED_PARAMS_PATH": "trained_params.pkl",
 
     # --- Classifier ---
     "CLASSIFIER_PATH": "color_classifier.pkl",
@@ -422,86 +428,6 @@ def hierarchical_color_clustering(pixels, distance_percentile=85, sample_size=30
     return np.array(centers), counts, cut_height, Z, sample
 
 
-# ============================================================
-# DBSCAN CLUSTERING
-# ============================================================
-def dbscan_color_clustering(pixels, eps_percentile=10, min_samples_fraction=0.002, random_state=42):
-    """
-    DBSCAN density-based clustering — adapts to local color density and
-    naturally detects both dominant and rare colors without pre-specifying K.
-
-    Parameters
-    ----------
-    pixels : np.ndarray
-        Array of pixel values (N, 3).
-    eps_percentile : int
-        Percentile of pairwise distances to use as eps.
-    min_samples_fraction : float
-        Fraction of total pixels for min_samples parameter.
-    random_state : int
-        Random seed for sampling.
-
-    Returns
-    -------
-    np.ndarray, list, int, dict
-        Cluster centers (RGB), counts, number of clusters, and DBSCAN parameters.
-    """
-    logger.info("  Running DBSCAN Clustering...")
-
-    sample_size = min(3000, len(pixels))
-    idx = np.random.RandomState(random_state).choice(len(pixels), sample_size, replace=False)
-    sample = pixels[idx]
-
-    # Normalize for DBSCAN
-    scaler = StandardScaler()
-    sample_scaled = scaler.fit_transform(sample)
-
-    # Adaptive eps from pairwise distance distribution
-    pairwise_dists = pdist(sample_scaled)
-    eps = float(np.percentile(pairwise_dists, eps_percentile))
-    min_samples = max(3, int(len(pixels) * min_samples_fraction))
-
-    db = DBSCAN(eps=eps, min_samples=min_samples)
-    labels_sample = db.fit_predict(sample_scaled)
-
-    unique_labels = set(labels_sample)
-    n_noise = int((labels_sample == -1).sum())
-    n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
-
-    # Compute centers from sample
-    sample_centers = []
-    for lbl in sorted(unique_labels):
-        if lbl == -1:
-            continue
-        mask = labels_sample == lbl
-        sample_centers.append(sample[mask].mean(axis=0))
-
-    if not sample_centers:
-        logger.warning("  DBSCAN: No clusters found. Try adjusting eps_percentile.")
-        return np.array([pixels.mean(axis=0)]), [len(pixels)], 1, {}
-
-    sample_centers = np.array(sample_centers)
-
-    # Assign all pixels to nearest DBSCAN center
-    diffs = pixels[:, np.newaxis, :] - sample_centers[np.newaxis, :, :]
-    full_dists = np.linalg.norm(diffs, axis=2)
-    full_labels = np.argmin(full_dists, axis=1)
-
-    centers = []
-    counts = []
-    for k in range(len(sample_centers)):
-        mask = full_labels == k
-        if mask.any():
-            centers.append(pixels[mask].mean(axis=0))
-            counts.append(int(mask.sum()))
-
-    params = {"eps": eps, "min_samples": min_samples, "n_noise_sample": n_noise}
-    logger.info(
-        f"  DBSCAN: {n_clusters} clusters found "
-        f"(eps={eps:.3f}, min_samples={min_samples}, noise in sample={n_noise})"
-    )
-    return np.array(centers), counts, n_clusters, params
-
 
 # ============================================================
 # K-MEANS CLUSTERING (with optimal K)
@@ -531,56 +457,43 @@ def kmeans_color_clustering(pixels, optimal_k, random_state=42):
     return clt.cluster_centers_, raw_counts
 
 
+
 # ============================================================
-# PATTERN ANALYSIS
+# SCALE-INDEPENDENT IMAGE NORMALISATION
 # ============================================================
-def analyze_secondary_pattern(mask_color, shell_area_pixels):
+def normalize_image_size(image, target_size=1000):
     """
-    Analyze the geometry of secondary colors to identify pattern types
-    (stripes/bands, spots/dots, irregular patches, etc.).
+    Resize an image to a square canvas of ``target_size × target_size`` pixels,
+    preserving the original aspect ratio by padding with black borders.
+
+    All images processed by this pipeline are normalized to the same canvas
+    size before color analysis so that pixel-count-based coverage percentages
+    are directly comparable regardless of the original image resolution.
 
     Parameters
     ----------
-    mask_color : np.ndarray
-        Binary mask of the color region.
-    shell_area_pixels : int
-        Total shell area in pixels (used for minimum area filtering).
+    image : np.ndarray
+        Input image in any channel format (H × W × C).
+    target_size : int, optional
+        Side length of the square output canvas in pixels. Default: 1000.
 
     Returns
     -------
-    str, int
-        Pattern type label and number of detected shapes.
+    np.ndarray
+        Normalized image of shape ``(target_size, target_size, C)``.
     """
-    contours, _ = cv2.findContours(mask_color, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    h, w = image.shape[:2]
+    scale = target_size / max(h, w)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    min_area = shell_area_pixels * 0.0005
-    valid = [c for c in contours if cv2.contourArea(c) > min_area]
-    count = len(valid)
-
-    if count == 0:
-        return "Minor Traces", 0
-    if count < 5:
-        return "Large Patches", count
-
-    elongated = 0
-    for c in valid:
-        if len(c) < 5:
-            continue
-        try:
-            _, (ma, MA), _ = cv2.fitEllipse(c)
-        except cv2.error:
-            continue
-        if ma == 0 or MA == 0 or min(MA, ma) == 0:
-            continue
-        if max(MA, ma) / min(MA, ma) > 3.0:
-            elongated += 1
-
-    ratio = elongated / count
-    if ratio > 0.4:
-        return "STRIPES / BANDS", count
-    if count > 20:
-        return "SPOTS / DOTS", count
-    return "IRREGULAR PATCHES", count
+    channels = image.shape[2] if image.ndim == 3 else 1
+    canvas = np.zeros((target_size, target_size, channels), dtype=image.dtype)
+    y_off = (target_size - new_h) // 2
+    x_off = (target_size - new_w) // 2
+    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+    return canvas
 
 
 # ============================================================
@@ -608,6 +521,11 @@ def preprocess_image(file_path, config):
         return None
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    # --- Scale-independent normalisation ---
+    target_size = config.get("STANDARD_CANVAS_SIZE", 1000)
+    img_rgb = normalize_image_size(img_rgb, target_size)
+    logger.info(f"  Normalized to {target_size}×{target_size} canvas.")
 
     # Background removal
     if REMBG_AVAILABLE:
@@ -746,33 +664,16 @@ def run_clustering_pipeline(pixel_stack, config):
             "merge_threshold": merge_thresh,
         }
 
-    if method in ("dbscan", "all"):
-        db_centers, db_counts, db_n, db_params = dbscan_color_clustering(
-            pixel_stack,
-            eps_percentile=config["DBSCAN_EPS_PERCENTILE"],
-            min_samples_fraction=config["DBSCAN_MIN_SAMPLES_FRACTION"],
-        )
-        merge_thresh = config.get("COLOR_MERGE_THRESHOLD") or compute_adaptive_merge_threshold(
-            db_centers, config["COLOR_MERGE_PERCENTILE"]
-        )
-        db_centers_merged, db_counts_merged = merge_similar_clusters(db_centers, db_counts, merge_thresh)
-        results["dbscan"] = {
-            "centers": db_centers_merged,
-            "counts": db_counts_merged,
-            "n_clusters_raw": db_n,
-            "dbscan_params": db_params,
-            "merge_threshold": merge_thresh,
-        }
-
     return results
 
 
 # ============================================================
 # RESULT FORMATTING
 # ============================================================
-def format_color_results(centers, counts, total_area_cm, grand_total_pixels, unit):
+def format_color_results(centers, counts):
     """
-    Sort and enrich cluster results with color names, hex codes, areas, and roles.
+    Sort and enrich cluster results with color names, hex codes, and percentage
+    coverage.  All output is scale-independent (percentages of the pigmented area).
 
     Parameters
     ----------
@@ -780,12 +681,6 @@ def format_color_results(centers, counts, total_area_cm, grand_total_pixels, uni
         Cluster centers in RGB.
     counts : list of int
         Pixel counts per cluster.
-    total_area_cm : float
-        Total shell area in cm².
-    grand_total_pixels : int
-        Total shell pixel count.
-    unit : str
-        Unit name (e.g., "cm").
 
     Returns
     -------
@@ -798,7 +693,6 @@ def format_color_results(centers, counts, total_area_cm, grand_total_pixels, uni
     colors_out = []
     for i, (count, center) in enumerate(sorted_pairs):
         pct = (count / total_pigment) * 100 if total_pigment > 0 else 0.0
-        area = (count / grand_total_pixels) * total_area_cm if grand_total_pixels > 0 else 0.0
         rgb = np.clip(center, 0, 255).astype(np.uint8)
         name = get_closest_color_name(rgb)
         hex_c = "#{:02x}{:02x}{:02x}".format(*rgb)
@@ -811,16 +705,227 @@ def format_color_results(centers, counts, total_area_cm, grand_total_pixels, uni
             "rgb": rgb.tolist(),
             "count": count,
             "pct_of_pigment": round(pct, 2),
-            "area_cm2": round(area, 4),
-            "unit": unit,
         })
 
     return colors_out
 
 
+
 # ============================================================
-# SUPERVISED CLASSIFIER (OPTIONAL)
+# PARAMETER TRAINING SYSTEM
 # ============================================================
+def train_clustering_params(folder_path, config=None, save_path="trained_params.pkl"):
+    """
+    Analyze a folder of training images and optimize all tunable clustering
+    parameters by finding the values that perform best on average across the
+    entire training set.
+
+    The following parameters are optimized:
+
+    * ``NUM_CLUSTERS_MIN`` – Lower bound of the K search range.
+    * ``NUM_CLUSTERS_MAX`` – Upper bound of the K search range.
+    * ``COLOR_MERGE_PERCENTILE`` – Percentile used for the adaptive merge threshold.
+    * ``HIERARCHICAL_DISTANCE_PERCENTILE`` – Cut-height percentile for hierarchical
+      clustering.
+    * ``optimal_k`` – Average best K found across training images (used as a
+      suggested default when running analysis).
+    * ``optimal_merge_threshold`` – Average adaptive merge threshold across training
+      images.
+
+    No manual labels are needed.  Clustering is performed automatically and the
+    best parameters are inferred from the data.
+
+    Parameters
+    ----------
+    folder_path : str
+        Path to folder containing training shell images.
+    config : dict, optional
+        Base configuration dictionary.  Uses ``DEFAULT_CONFIG`` when omitted.
+    save_path : str, optional
+        Destination path for the saved parameter file (pickle format).
+        Default: ``"trained_params.pkl"``.
+
+    Returns
+    -------
+    dict
+        Dictionary of optimized parameters, also persisted to ``save_path``.
+    """
+    if config is None:
+        config = DEFAULT_CONFIG.copy()
+
+    valid_exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+    image_files = sorted([
+        f for f in glob.glob(os.path.join(folder_path, "*.*"))
+        if os.path.splitext(f)[1].lower() in valid_exts
+    ])
+    if not image_files:
+        logger.error(f"No valid images found in: {folder_path}")
+        return {}
+
+    logger.info(f"Training on {len(image_files)} image(s) in: {folder_path}")
+
+    # Candidates to search over
+    k_min_candidates = list(range(2, 8))
+    k_max_candidates = list(range(8, 25))
+    merge_pct_candidates = [15, 20, 25, 30, 35, 40]
+    hier_pct_candidates = [70, 75, 80, 85, 90, 95]
+
+    optimal_k_values = []
+    merge_threshold_values = []
+    best_merge_pct_values = []
+    best_hier_pct_values = []
+
+    for i, file in enumerate(image_files):
+        fname = os.path.basename(file)
+        logger.info(f"  [{i+1}/{len(image_files)}] {fname}")
+        data = preprocess_image(file, config)
+        if data is None or len(data["pigment_pixels"]) < 10:
+            logger.warning(f"    Skipping {fname}: insufficient pigment pixels.")
+            continue
+
+        pixels = data["pigment_pixels"].astype(float)
+
+        # --- Find best K for this image ---
+        k_abs_min = min(k_min_candidates)
+        k_abs_max = max(k_max_candidates)
+        best_k, _ = find_optimal_k(
+            pixels,
+            k_min=k_abs_min,
+            k_max=k_abs_max,
+        )
+        optimal_k_values.append(best_k)
+        logger.info(f"    Best K: {best_k}")
+
+        # --- Find best merge percentile (yields lowest intra-cluster LAB spread) ---
+        best_mp_score = float("inf")
+        best_mp = config["COLOR_MERGE_PERCENTILE"]
+        best_merge_thresh = 15.0  # safe default if no merge candidate is selected
+        _, raw_counts = kmeans_color_clustering(pixels, best_k)
+
+        # Use K-Means centers for merge percentile search
+        clt_tmp = KMeans(n_clusters=best_k, n_init="auto", random_state=42)
+        clt_tmp.fit(pixels)
+        raw_centers_tmp = clt_tmp.cluster_centers_
+
+        for mp in merge_pct_candidates:
+            thresh = compute_adaptive_merge_threshold(raw_centers_tmp, mp)
+            merged_c, merged_n = merge_similar_clusters(raw_centers_tmp, raw_counts, thresh)
+            # Prefer fewer, more distinct merged clusters
+            if len(merged_c) > 0:
+                score = -len(merged_c)  # fewer final clusters = tighter merge
+                if score < best_mp_score:
+                    best_mp_score = score
+                    best_mp = mp
+                    best_merge_thresh = thresh
+        best_merge_pct_values.append(best_mp)
+        merge_threshold_values.append(best_merge_thresh)
+        logger.info(f"    Best merge percentile: {best_mp}  threshold: {best_merge_thresh:.2f}")
+
+        # --- Find best hierarchical distance percentile ---
+        best_hp_score = float("inf")
+        best_hp = config["HIERARCHICAL_DISTANCE_PERCENTILE"]
+        for hp in hier_pct_candidates:
+            h_centers, h_counts, _, _, _ = hierarchical_color_clustering(pixels, distance_percentile=hp)
+            # Aim for a reasonable number of clusters (similar to best_k)
+            score = abs(len(h_centers) - best_k)
+            if score < best_hp_score:
+                best_hp_score = score
+                best_hp = hp
+        best_hier_pct_values.append(best_hp)
+        logger.info(f"    Best hierarchical percentile: {best_hp}")
+
+    if not optimal_k_values:
+        logger.error("Training failed: no images yielded valid pigment data.")
+        return {}
+
+    avg_k = float(np.mean(optimal_k_values))
+    avg_merge_threshold = float(np.mean(merge_threshold_values))
+    avg_merge_pct = float(np.mean(best_merge_pct_values))
+    avg_hier_pct = float(np.mean(best_hier_pct_values))
+
+    # Derive k_min / k_max from the distribution of optimal K values
+    trained_k_min = max(2, int(np.percentile(optimal_k_values, 10)))
+    trained_k_max = int(np.percentile(optimal_k_values, 90)) + 2  # a little headroom
+
+    trained_params = {
+        "NUM_CLUSTERS_MIN": trained_k_min,
+        "NUM_CLUSTERS_MAX": trained_k_max,
+        "COLOR_MERGE_PERCENTILE": int(round(avg_merge_pct)),
+        "HIERARCHICAL_DISTANCE_PERCENTILE": int(round(avg_hier_pct)),
+        "optimal_k": int(round(avg_k)),
+        "optimal_merge_threshold": round(avg_merge_threshold, 2),
+        "training_images": len(optimal_k_values),
+        "k_values_found": [int(v) for v in optimal_k_values],
+    }
+
+    with open(save_path, "wb") as f:
+        pickle.dump(trained_params, f)
+
+    logger.info("\n" + "=" * 55)
+    logger.info("  TRAINING COMPLETE")
+    logger.info("=" * 55)
+    logger.info(f"  Images trained on   : {trained_params['training_images']}")
+    logger.info(f"  K values found      : {trained_params['k_values_found']}")
+    logger.info(f"  Trained K_MIN       : {trained_params['NUM_CLUSTERS_MIN']}")
+    logger.info(f"  Trained K_MAX       : {trained_params['NUM_CLUSTERS_MAX']}")
+    logger.info(f"  Avg optimal K       : {avg_k:.1f}")
+    logger.info(f"  Merge percentile    : {trained_params['COLOR_MERGE_PERCENTILE']}")
+    logger.info(f"  Avg merge threshold : {trained_params['optimal_merge_threshold']}")
+    logger.info(f"  Hier. dist. pct     : {trained_params['HIERARCHICAL_DISTANCE_PERCENTILE']}")
+    logger.info(f"  Saved to            : {save_path}")
+    logger.info("=" * 55)
+
+    return trained_params
+
+
+def load_trained_params(path):
+    """
+    Load trained clustering parameters from disk.
+
+    Parameters
+    ----------
+    path : str
+        Path to the pickled parameter file produced by :func:`train_clustering_params`.
+
+    Returns
+    -------
+    dict or None
+        Parameter dictionary, or ``None`` if the file does not exist.
+    """
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        params = pickle.load(f)
+    logger.info(f"  Trained parameters loaded from: {path}")
+    return params
+
+
+def apply_trained_params(config, trained_params):
+    """
+    Overlay trained parameters onto a configuration dictionary.
+
+    Parameters
+    ----------
+    config : dict
+        Base configuration dictionary.
+    trained_params : dict
+        Optimized parameters from :func:`train_clustering_params`.
+
+    Returns
+    -------
+    dict
+        Updated configuration dictionary.
+    """
+    cfg = config.copy()
+    for key in ("NUM_CLUSTERS_MIN", "NUM_CLUSTERS_MAX",
+                "COLOR_MERGE_PERCENTILE", "HIERARCHICAL_DISTANCE_PERCENTILE"):
+        if key in trained_params:
+            cfg[key] = trained_params[key]
+    if "optimal_merge_threshold" in trained_params:
+        cfg["COLOR_MERGE_THRESHOLD"] = trained_params["optimal_merge_threshold"]
+    return cfg
+
+
 def train_color_classifier(labeled_data, save_path="color_classifier.pkl"):
     """
     Train a Random Forest color classifier on labeled pixel data.
@@ -837,21 +942,6 @@ def train_color_classifier(labeled_data, save_path="color_classifier.pkl"):
         must have shape ``(N, 3)`` in **RGB** order.  ``label_string`` is the
         human-readable color name (e.g. ``"purple"``, ``"brown"``, ``"white"``).
 
-        Example (unsupervised labels from clustering)::
-
-            labeled_data = [
-                (purple_cluster_pixels, "purple"),
-                (brown_cluster_pixels,  "brown"),
-                (white_cluster_pixels,  "white"),
-            ]
-
-        Example (hand-labeled pixel arrays)::
-
-            labeled_data = [
-                (np.array([[128, 0, 128], ...]), "purple"),
-                (np.array([[139, 90,  43], ...]), "brown"),
-            ]
-
     save_path : str, optional
         File path for the saved classifier (``pickle`` format).
         Default: ``"color_classifier.pkl"``.
@@ -860,19 +950,6 @@ def train_color_classifier(labeled_data, save_path="color_classifier.pkl"):
     -------
     sklearn.ensemble.RandomForestClassifier
         The trained classifier, also persisted to ``save_path``.
-
-    Notes
-    -----
-    - Each RGB pixel is converted to CIELAB before training so that the model
-      operates in a perceptually uniform color space.
-    - The Random Forest uses 100 estimators and all available CPU cores
-      (``n_jobs=-1``).
-    - After training, apply the classifier by loading it with
-      :func:`load_color_classifier` and calling ``clf.predict(lab_pixels)``.
-
-    See Also
-    --------
-    load_color_classifier : Load a previously saved classifier from disk.
     """
     logger.info("Training supervised color classifier...")
     X, y = [], []
@@ -908,17 +985,16 @@ def load_color_classifier(path):
 # ============================================================
 def print_color_table(colors, method_name="K-Means"):
     """Print a formatted color table to the console."""
-    header = f"\n{'='*75}\n  {method_name.upper()} COLOR RESULTS\n{'='*75}"
+    header = f"\n{'='*65}\n  {method_name.upper()} COLOR RESULTS\n{'='*65}"
     print(header)
-    print(f"{'RANK':<5} {'ROLE':<12} {'COLOR NAME':<22} {'HEX':<9} {'AREA':<12} {'% SHARE'}")
-    print("-" * 75)
+    print(f"{'RANK':<5} {'ROLE':<12} {'COLOR NAME':<22} {'HEX':<9} {'% SHARE'}")
+    print("-" * 65)
     for c in colors:
-        area_str = f"{c['area_cm2']:.2f} {c['unit']}²"
         print(
             f"{c['rank']:<5} {c['role']:<12} {c['name']:<22} {c['hex']:<9} "
-            f"{area_str:<12} {c['pct_of_pigment']:.1f}%"
+            f"{c['pct_of_pigment']:.1f}%"
         )
-    print("=" * 75)
+    print("=" * 65)
 
 
 def export_results(all_results, output_folder, timestamp):
@@ -1061,7 +1137,6 @@ def plot_color_palette(colors, method_name, ax_pie, ax_bar):
 def build_visualization_dashboard(
     processed_images,
     clustering_results,
-    pattern_results,
     k_metrics,
     hierarchical_linkage,
     h_cut_height,
@@ -1076,15 +1151,14 @@ def build_visualization_dashboard(
     Panels:
     1. Processed image gallery (top row)
     2. Color palettes for each method (pie + bar)
-    3. Pattern analysis summary
     """
     method_names = list(clustering_results.keys())
     n_methods = len(method_names)
     n_images = len(processed_images)
 
     fig = plt.figure(figsize=(max(18, n_images * 5), 6 + n_methods * 5))
-    outer_gs = gridspec.GridSpec(2 + n_methods, 1, figure=fig,
-                                 height_ratios=[3] + [4] * n_methods + [2])
+    outer_gs = gridspec.GridSpec(1 + n_methods, 1, figure=fig,
+                                 height_ratios=[3] + [4] * n_methods)
 
     # ---- Row 0: Image Gallery ----
     gallery_gs = gridspec.GridSpecFromSubplotSpec(
@@ -1106,22 +1180,8 @@ def build_visualization_dashboard(
         ax_bar = fig.add_subplot(method_gs[1])
         plot_color_palette(method_colors, method.upper(), ax_pie, ax_bar)
 
-    # ---- Last Row: Pattern Analysis Text ----
-    ax_pat = fig.add_subplot(outer_gs[-1])
-    ax_pat.axis("off")
-    if pattern_results:
-        pat_text = "SECONDARY PATTERN ANALYSIS\n" + "-" * 50 + "\n"
-        for method, patterns in pattern_results.items():
-            pat_text += f"\n[{method.upper()}]\n"
-            for entry in patterns:
-                pat_text += f"  {entry['color_name']}: {entry['n_shapes']} shapes → {entry['pattern_type']}\n"
-    else:
-        pat_text = "No secondary pattern analysis available."
-    ax_pat.text(0.01, 0.95, pat_text, transform=ax_pat.transAxes,
-                verticalalignment="top", fontsize=8, family="monospace")
-
     plt.suptitle(
-        "Shell Color Analysis Dashboard – Advanced Adaptive Clustering",
+        "Shell Color Analysis Dashboard – Scale-Independent Adaptive Clustering",
         fontsize=13, fontweight="bold"
     )
     plt.tight_layout()
@@ -1142,79 +1202,11 @@ def build_visualization_dashboard(
 
 
 # ============================================================
-# PATTERN ANALYSIS (per method)
-# ============================================================
-def run_pattern_analysis(clustering_results, sample_data, config):
-    """
-    Run secondary pattern analysis for each clustering method.
-
-    Parameters
-    ----------
-    clustering_results : dict
-        Method name → list of color dicts.
-    sample_data : dict or None
-        Preprocessed data from the largest image.
-    config : dict
-        Configuration dictionary.
-
-    Returns
-    -------
-    dict
-        Method name → list of pattern result dicts.
-    """
-    if sample_data is None:
-        return {}
-
-    img_hsv = sample_data["img_hsv"]
-    mask_pigment = sample_data["mask_pigment"]
-    shell_pixel_count = sample_data["shell_pixel_count"]
-
-    pattern_results = {}
-    for method, colors in clustering_results.items():
-        method_patterns = []
-        for c in colors:
-            if c["role"] != "SECONDARY":
-                continue
-
-            rgb = np.array(c["rgb"], dtype=np.uint8)
-            c_hsv = cv2.cvtColor(rgb[np.newaxis, np.newaxis, :], cv2.COLOR_RGB2HSV)[0][0]
-
-            h_tol, sv_tol = 15, 60
-            lower = np.array([
-                max(0, int(c_hsv[0]) - h_tol),
-                max(40, int(c_hsv[1]) - sv_tol),
-                max(40, int(c_hsv[2]) - sv_tol),
-            ])
-            upper = np.array([
-                min(179, int(c_hsv[0]) + h_tol),
-                min(255, int(c_hsv[1]) + sv_tol),
-                min(255, int(c_hsv[2]) + sv_tol),
-            ])
-
-            mask = cv2.inRange(img_hsv, lower, upper)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-            mask = cv2.bitwise_and(mask, mask, mask=mask_pigment)
-
-            pattern_type, n_shapes = analyze_secondary_pattern(mask, shell_pixel_count)
-            method_patterns.append({
-                "color_name": c["name"],
-                "hex": c["hex"],
-                "pattern_type": pattern_type,
-                "n_shapes": n_shapes,
-            })
-
-        pattern_results[method] = method_patterns
-
-    return pattern_results
-
-
-# ============================================================
 # MAIN PROCESSING FUNCTION
 # ============================================================
-def process_images(folder_path, config=None):
+def process_images(folder_path, config=None, label=None):
     """
-    Main pipeline: load images, preprocess, cluster colors, analyze patterns,
-    visualize, and export results.
+    Main pipeline: load images, preprocess, cluster colors, visualize, and export.
 
     Parameters
     ----------
@@ -1222,14 +1214,23 @@ def process_images(folder_path, config=None):
         Path to folder containing shell images.
     config : dict, optional
         Configuration dictionary. Uses DEFAULT_CONFIG if not provided.
+    label : str, optional
+        Label to distinguish runs in console output (e.g. "Default" vs "Trained").
+
+    Returns
+    -------
+    dict
+        Formatted clustering results keyed by method name.
     """
     if config is None:
         config = DEFAULT_CONFIG.copy()
 
+    run_label = f" [{label}]" if label else ""
+
     # Validate inputs
     if not folder_path or not os.path.exists(folder_path):
         logger.error(f"ERROR: Invalid INPUT_FOLDER path: '{folder_path}'")
-        return
+        return {}
 
     valid_exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
     image_files = sorted([
@@ -1239,17 +1240,15 @@ def process_images(folder_path, config=None):
 
     if not image_files:
         logger.error(f"No valid images found in: {folder_path}")
-        return
+        return {}
 
-    logger.info(f"Found {len(image_files)} image(s) to process.")
+    logger.info(f"Found {len(image_files)} image(s) to process.{run_label}")
 
     output_folder = config.get("OUTPUT_FOLDER", "./output")
     os.makedirs(output_folder, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    pixels_per_unit = config["PIXELS_PER_UNIT"]
-    unit = config["UNIT_NAME"]
-    scale_sq = pixels_per_unit ** 2
+    if label:
+        timestamp = f"{timestamp}_{label.lower().replace(' ', '_')}"
 
     total_white = 0
     total_pigment = 0
@@ -1257,13 +1256,10 @@ def process_images(folder_path, config=None):
     all_pigment_pixels = []
     processed_images_gallery = []
 
-    best_sample_data = None
-    best_sample_area = 0
-
     # ---- Image-level processing ----
     for i, file in enumerate(image_files):
         fname = os.path.basename(file)
-        logger.info(f"[{i+1}/{len(image_files)}] Processing: {fname}")
+        logger.info(f"[{i+1}/{len(image_files)}] Processing: {fname}{run_label}")
         data = preprocess_image(file, config)
         if data is None:
             continue
@@ -1276,36 +1272,34 @@ def process_images(folder_path, config=None):
         if len(data["pigment_pixels"]) > 0:
             all_pigment_pixels.append(data["pigment_pixels"])
 
-        if data["shell_pixel_count"] > best_sample_area:
-            best_sample_area = data["shell_pixel_count"]
-            best_sample_data = data
-
     # ---- Summary stats ----
     if grand_total_pixels == 0:
         logger.error("No shell area detected in any image.")
-        return
+        return {}
 
-    total_area_cm = grand_total_pixels / scale_sq
-    white_area = total_white / scale_sq
-    pigment_area = total_pigment / scale_sq
+    canvas = config.get("STANDARD_CANVAS_SIZE", 1000)
+    total_pct = 100.0
+    white_pct = (total_white / grand_total_pixels * 100) if grand_total_pixels > 0 else 0.0
+    pigment_pct = (total_pigment / grand_total_pixels * 100) if grand_total_pixels > 0 else 0.0
 
     print("\n" + "=" * 65)
-    print("      ANALYSIS SUMMARY")
+    print(f"      ANALYSIS SUMMARY{run_label}")
     print("=" * 65)
-    print(f"Total Shell Surface Area: {total_area_cm:.2f} {unit}²")
-    print(f"White/Reflective Area:    {white_area:.2f} {unit}²")
-    print(f"Pigmented Area:           {pigment_area:.2f} {unit}²")
+    print(f"Normalized canvas size      : {canvas}×{canvas} px")
+    print(f"Total shell coverage        : {total_pct:.1f}% of canvas")
+    print(f"White/Reflective coverage   : {white_pct:.1f}% of shell")
+    print(f"Pigmented coverage          : {pigment_pct:.1f}% of shell")
     print("=" * 65)
 
     if not all_pigment_pixels:
         logger.warning("No pigmentation found in any image.")
-        return
+        return {}
 
     pixel_stack = np.vstack(all_pigment_pixels)
     logger.info(f"Total pigment pixels collected: {len(pixel_stack):,}")
 
     # ---- Clustering ----
-    logger.info("\n--- Running Adaptive Clustering Pipeline ---")
+    logger.info(f"\n--- Running Adaptive Clustering Pipeline{run_label} ---")
     raw_cluster_results = run_clustering_pipeline(pixel_stack, config)
 
     # ---- Format results ----
@@ -1316,12 +1310,9 @@ def process_images(folder_path, config=None):
     h_sample = None
 
     for method, res in raw_cluster_results.items():
-        colors = format_color_results(
-            res["centers"], res["counts"],
-            total_area_cm, grand_total_pixels, unit
-        )
+        colors = format_color_results(res["centers"], res["counts"])
         formatted_results[method] = colors
-        print_color_table(colors, method)
+        print_color_table(colors, f"{method}{run_label}")
 
         if method == "kmeans" and "k_metrics" in res:
             k_metrics = res["k_metrics"]
@@ -1330,26 +1321,14 @@ def process_images(folder_path, config=None):
             h_cut_height = res.get("distance_threshold")
             h_sample = res.get("sample")
 
-    # ---- Pattern Analysis ----
-    logger.info("\n--- Secondary Pattern Analysis ---")
-    pattern_results = run_pattern_analysis(formatted_results, best_sample_data, config)
-
-    for method, patterns in pattern_results.items():
-        print(f"\n[{method.upper()}] Pattern Analysis:")
-        if not patterns:
-            print("  No secondary colors found (solid/uniform shell).")
-        for p in patterns:
-            print(f"  {p['color_name']} ({p['hex']}): {p['n_shapes']} shapes → {p['pattern_type']}")
-
     # ---- Export ----
     export_results(formatted_results, output_folder, timestamp)
 
     # ---- Visualization ----
-    logger.info("\n--- Building Visualization Dashboard ---")
+    logger.info(f"\n--- Building Visualization Dashboard{run_label} ---")
     build_visualization_dashboard(
         processed_images=processed_images_gallery,
         clustering_results=formatted_results,
-        pattern_results=pattern_results,
         k_metrics=k_metrics,
         hierarchical_linkage=hierarchical_linkage,
         h_cut_height=h_cut_height,
@@ -1359,7 +1338,8 @@ def process_images(folder_path, config=None):
         timestamp=timestamp,
     )
 
-    logger.info("Analysis complete.")
+    logger.info(f"Analysis complete.{run_label}")
+    return formatted_results
 
 
 # ============================================================
@@ -1370,23 +1350,26 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Advanced Adaptive Color Detection Framework for Shell Organisms. "
-            "Runs K-Means, Hierarchical, and/or DBSCAN clustering on shell images "
-            "and optionally trains a supervised Random Forest color classifier. "
+            "Runs K-Means and/or Hierarchical clustering on scale-independent "
+            "normalized shell images.  Can also train optimized clustering "
+            "parameters from sample images and compare trained vs. default results. "
             "See COMMANDS.md for a quick-reference and PARAMETER_GUIDE.md for "
             "detailed parameter tuning guidance."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  Analyze with all methods (default):\n"
+            "  Analyze with both methods (default):\n"
             "    python shell_color_analysis.py --folder images --no-show\n\n"
             "  Analyze with K-Means only, custom K range:\n"
             "    python shell_color_analysis.py --folder images --method kmeans "
             "--k-min 3 --k-max 15 --no-show\n\n"
-            "  Train the classifier on representative images (no labels needed):\n"
+            "  Train clustering parameters on sample images (no labels needed):\n"
             "    python shell_color_analysis.py --folder training_data --train\n\n"
-            "  Apply the trained classifier to new images:\n"
-            "    python shell_color_analysis.py --folder trial --no-show\n"
+            "  Analyze with trained parameters:\n"
+            "    python shell_color_analysis.py --folder trial --use-trained-params\n\n"
+            "  Compare trained vs. default results side-by-side:\n"
+            "    python shell_color_analysis.py --folder trial --compare-trained\n"
         ),
     )
     parser.add_argument(
@@ -1407,13 +1390,12 @@ def parse_args():
     )
     parser.add_argument(
         "--method", type=str, default="all",
-        choices=["kmeans", "hierarchical", "dbscan", "all"],
+        choices=["kmeans", "hierarchical", "all"],
         help=(
             "Clustering method(s) to use. "
             "'kmeans' selects the optimal K automatically; "
             "'hierarchical' uses agglomerative clustering and produces a dendrogram; "
-            "'dbscan' detects dominant and rare colors without a pre-specified K; "
-            "'all' runs all three and writes a combined JSON comparison report. "
+            "'all' runs both and writes a combined JSON comparison report. "
             "(default: %(default)s)"
         ),
     )
@@ -1462,11 +1444,27 @@ def parse_args():
     parser.add_argument(
         "--train", action="store_true",
         help=(
-            "Train the supervised Random Forest color classifier on the images in "
-            "--folder. No manual labeling is required: clustering automatically "
-            "discovers color groups which are used as training labels. "
-            "The trained model is saved to the path set by CLASSIFIER_PATH in "
-            "DEFAULT_CONFIG (default: color_classifier.pkl)."
+            "Train clustering parameters on the images in --folder. "
+            "No manual labeling is required: the pipeline automatically finds "
+            "the best K range, merge percentile, and hierarchical distance percentile "
+            "from the training images, then saves them to the path set by "
+            "TRAINED_PARAMS_PATH in DEFAULT_CONFIG (default: trained_params.pkl)."
+        ),
+    )
+    parser.add_argument(
+        "--use-trained-params", action="store_true",
+        help=(
+            "Load previously trained parameters from TRAINED_PARAMS_PATH and use "
+            "them for this analysis run instead of DEFAULT_CONFIG defaults. "
+            "Run --train first to generate the parameter file."
+        ),
+    )
+    parser.add_argument(
+        "--compare-trained", action="store_true",
+        help=(
+            "Run the analysis twice — once with default parameters and once with "
+            "trained parameters — and display both results side-by-side so you can "
+            "compare the improvement."
         ),
     )
     return parser.parse_args()
@@ -1474,6 +1472,10 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+
+    if args.no_show:
+        import matplotlib
+        matplotlib.use("Agg")
 
     cfg = DEFAULT_CONFIG.copy()
     cfg["INPUT_FOLDER"] = args.folder
@@ -1484,16 +1486,41 @@ if __name__ == "__main__":
     cfg["COLOR_MERGE_THRESHOLD"] = args.merge_threshold
     cfg["SAVE_FIGURES"] = not args.no_save
 
-    if args.no_show:
-        import matplotlib
-        matplotlib.use("Agg")
-
     if args.train:
-        logger.info(
-            "Training mode: prepare labeled_data as list of (pixel_array, label) "
-            "and call train_color_classifier()."
+        # ---- Parameter training mode ----
+        train_clustering_params(
+            folder_path=cfg["INPUT_FOLDER"],
+            config=cfg,
+            save_path=cfg["TRAINED_PARAMS_PATH"],
         )
-        # Example: labeled_data = [(pixels_array, "purple"), ...]
-        # train_color_classifier(labeled_data, save_path=cfg["CLASSIFIER_PATH"])
+
+    elif args.compare_trained:
+        # ---- Side-by-side comparison mode ----
+        trained_params = load_trained_params(cfg["TRAINED_PARAMS_PATH"])
+        if trained_params is None:
+            logger.error(
+                f"No trained parameter file found at '{cfg['TRAINED_PARAMS_PATH']}'. "
+                "Run with --train first."
+            )
+        else:
+            logger.info("=== Run 1/2: Default parameters ===")
+            process_images(cfg["INPUT_FOLDER"], config=cfg, label="Default")
+
+            trained_cfg = apply_trained_params(cfg, trained_params)
+            logger.info("=== Run 2/2: Trained parameters ===")
+            process_images(cfg["INPUT_FOLDER"], config=trained_cfg, label="Trained")
+
     else:
+        # ---- Normal analysis mode ----
+        if args.use_trained_params:
+            trained_params = load_trained_params(cfg["TRAINED_PARAMS_PATH"])
+            if trained_params is None:
+                logger.warning(
+                    f"No trained parameter file found at '{cfg['TRAINED_PARAMS_PATH']}'. "
+                    "Falling back to default parameters."
+                )
+            else:
+                cfg = apply_trained_params(cfg, trained_params)
+                logger.info("Using trained clustering parameters.")
+
         process_images(cfg["INPUT_FOLDER"], config=cfg)
