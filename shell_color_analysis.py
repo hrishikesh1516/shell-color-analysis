@@ -301,10 +301,28 @@ def kmeans_color_clustering(pixels, optimal_k, random_state=42):
 
 
 # ============================================================
-# SCALE-INDEPENDENT IMAGE NORMALISATION
+# PREPROCESSING FUNCTIONS
 # ============================================================
-def normalize_image_size(image, target_size=1000):
-    """Resize image to a square canvas preserving aspect ratio (letter-box)."""
+def normalize_image(image, target_size=1000):
+    """
+    Resize image to a standard target_size × target_size pixel canvas.
+
+    Aspect ratio is preserved using letter-boxing; padding is filled with
+    black pixels.  All subsequent analysis works entirely within this
+    normalised space.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Input image in any channel format (H, W, C).
+    target_size : int
+        Side length of the square output canvas in pixels.  Default 1000.
+
+    Returns
+    -------
+    np.ndarray
+        Square image of shape (target_size, target_size, C).
+    """
     h, w = image.shape[:2]
     scale = target_size / max(h, w)
     new_w, new_h = int(w * scale), int(h * scale)
@@ -317,49 +335,114 @@ def normalize_image_size(image, target_size=1000):
     return canvas
 
 
-# ============================================================
-# IMAGE PREPROCESSING
-# ============================================================
-def preprocess_image(file_path, config):
-    """Load, normalize, remove background/glare, and extract pigment pixels."""
-    img_bgr = cv2.imread(file_path)
-    if img_bgr is None:
-        logger.warning(f"  Could not read image: {file_path}")
-        return None
+# Keep the original name as an alias for backward compatibility.
+normalize_image_size = normalize_image
 
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    target_size = config.get("STANDARD_CANVAS_SIZE", 1000)
-    img_rgb = normalize_image_size(img_rgb, target_size)
-    logger.info(f"  Normalized to {target_size}x{target_size} canvas.")
 
+def extract_shell_mask(image):
+    """
+    Remove background from a normalised RGB image using ``rembg``.
+
+    Returns a binary boolean mask (True = shell foreground) together with
+    the RGBA image produced by rembg and the original-RGB working copy
+    with the background zeroed out.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        RGB image of shape (H, W, 3).  Should already be normalised to
+        the standard canvas size before calling this function.
+
+    Returns
+    -------
+    shell_mask : np.ndarray of bool, shape (H, W)
+        True for every pixel that belongs to the shell.
+    img_rgb_work : np.ndarray, shape (H, W, 3)
+        RGB image with background pixels set to black.
+    alpha : np.ndarray, shape (H, W), dtype uint8
+        Alpha channel from rembg (255 = opaque, 0 = background).
+    """
     if REMBG_AVAILABLE:
-        rembg_out = rembg_remove(Image.fromarray(img_rgb))
+        rembg_out = rembg_remove(Image.fromarray(image))
         img_rgba = np.array(rembg_out)
         alpha = img_rgba[:, :, 3]
         shell_mask = alpha > 10
         img_rgb_work = img_rgba[:, :, :3].copy()
     else:
-        alpha = np.full(img_rgb.shape[:2], 255, dtype=np.uint8)
-        shell_mask = np.ones(img_rgb.shape[:2], dtype=bool)
-        img_rgb_work = img_rgb.copy()
+        alpha = np.full(image.shape[:2], 255, dtype=np.uint8)
+        shell_mask = np.ones(image.shape[:2], dtype=bool)
+        img_rgb_work = image.copy()
 
     img_rgb_work[~shell_mask] = [0, 0, 0]
-    shell_pixel_count = int(shell_mask.sum())
-    if shell_pixel_count == 0:
-        logger.warning(f"  No shell detected in: {file_path}")
-        return None
+    return shell_mask, img_rgb_work, alpha
 
-    # Glare removal
-    hsv_temp = cv2.cvtColor(img_rgb_work, cv2.COLOR_RGB2HSV)
+
+def remove_glare(image, shell_mask, glare_threshold=245):
+    """
+    Remove specular glare from an RGB shell image using HSV detection and
+    inpainting.
+
+    Glare pixels are identified in the HSV V-channel (brightness ≥
+    ``glare_threshold`` with low saturation) then repaired with
+    ``cv2.INPAINT_TELEA`` so that the underlying pigment colour can be
+    estimated.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        RGB image (H, W, 3) with background already masked.
+    shell_mask : np.ndarray of bool, shape (H, W)
+        True for shell pixels (from :func:`extract_shell_mask`).
+    glare_threshold : int
+        HSV V-channel threshold above which a low-saturation pixel is
+        considered glare.  Default 245.
+
+    Returns
+    -------
+    np.ndarray
+        Inpainted RGB image with glare regions filled in.
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
     mask_glare = cv2.inRange(
-        hsv_temp,
-        np.array([0, 0, config["GLARE_THRESHOLD"]]),
+        hsv,
+        np.array([0, 0, glare_threshold]),
         np.array([180, 40, 255]),
     )
-    mask_glare = cv2.bitwise_and(mask_glare, mask_glare, mask=shell_mask.astype(np.uint8))
-    img_rgb_final = cv2.inpaint(img_rgb_work, mask_glare, 3, cv2.INPAINT_TELEA)
+    mask_glare = cv2.bitwise_and(
+        mask_glare, mask_glare, mask=shell_mask.astype(np.uint8)
+    )
+    return cv2.inpaint(image, mask_glare, 3, cv2.INPAINT_TELEA)
 
-    img_hsv = cv2.cvtColor(img_rgb_final, cv2.COLOR_RGB2HSV)
+
+def extract_pigment_pixels(image, shell_mask, config=None):
+    """
+    Extract only the pigmented (non-white, non-dark) shell pixels.
+
+    White/reflective areas and very dark shadow areas are excluded so that
+    clustering focuses on the actual pigmentation.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Glare-corrected RGB image (H, W, 3).
+    shell_mask : np.ndarray of bool, shape (H, W)
+        True for shell pixels.
+    config : dict, optional
+        Configuration dictionary.  Uses DEFAULT_CONFIG values if omitted.
+
+    Returns
+    -------
+    mask_pigment : np.ndarray, shape (H, W), dtype uint8
+        Binary mask (255 = pigmented pixel, 0 = excluded).
+    mask_white : np.ndarray, shape (H, W), dtype uint8
+        Binary mask of white/reflective pixels within the shell.
+    img_hsv : np.ndarray
+        HSV representation of *image* (useful for downstream callers).
+    """
+    if config is None:
+        config = DEFAULT_CONFIG
+
+    img_hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
     mask_white = cv2.inRange(
         img_hsv,
         np.array([0, 0, config["WHITE_BRIGHTNESS"]]),
@@ -371,9 +454,75 @@ def preprocess_image(file_path, config):
         np.array([180, 255, config["MIN_COLOR_BRIGHTNESS"]]),
     )
     mask_exclude = cv2.bitwise_or(mask_white, mask_dark)
-    mask_exclude = cv2.bitwise_and(mask_exclude, mask_exclude, mask=shell_mask.astype(np.uint8))
+    mask_exclude = cv2.bitwise_and(
+        mask_exclude, mask_exclude, mask=shell_mask.astype(np.uint8)
+    )
     mask_pigment = cv2.subtract(shell_mask.astype(np.uint8) * 255, mask_exclude)
-    mask_white_final = cv2.bitwise_and(mask_white, mask_white, mask=shell_mask.astype(np.uint8))
+    mask_white_shell = cv2.bitwise_and(
+        mask_white, mask_white, mask=shell_mask.astype(np.uint8)
+    )
+    return mask_pigment, mask_white_shell, img_hsv
+
+
+# ============================================================
+# IMAGE PREPROCESSING (orchestrates the functions above)
+# ============================================================
+def preprocess_image(file_path, config):
+    """
+    Load an image and apply the full preprocessing pipeline.
+
+    Steps applied in order:
+    1. Load image from disk.
+    2. Normalize to ``STANDARD_CANVAS_SIZE`` × ``STANDARD_CANVAS_SIZE`` pixels
+       via :func:`normalize_image`.
+    3. Remove background using :func:`extract_shell_mask`.
+    4. Remove glare using :func:`remove_glare`.
+    5. Extract pigmented areas using :func:`extract_pigment_pixels`.
+
+    All coordinates and area measurements returned in this dict refer to
+    the normalised canvas; no original image dimensions are used.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the image file.
+    config : dict
+        Configuration dictionary (see DEFAULT_CONFIG).
+
+    Returns
+    -------
+    dict or None
+        Dictionary of preprocessed data, or None if the image cannot be
+        processed.
+    """
+    img_bgr = cv2.imread(file_path)
+    if img_bgr is None:
+        logger.warning(f"  Could not read image: {file_path}")
+        return None
+
+    # Step 1 – normalise to standard canvas
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    target_size = config.get("STANDARD_CANVAS_SIZE", 1000)
+    img_rgb = normalize_image(img_rgb, target_size)
+    logger.info(f"  Normalized to {target_size}x{target_size} canvas.")
+
+    # Step 2 – background removal
+    shell_mask, img_rgb_work, alpha = extract_shell_mask(img_rgb)
+    shell_pixel_count = int(shell_mask.sum())
+    if shell_pixel_count == 0:
+        logger.warning(f"  No shell detected in: {file_path}")
+        return None
+
+    # Step 3 – glare removal
+    img_rgb_final = remove_glare(
+        img_rgb_work, shell_mask,
+        glare_threshold=config.get("GLARE_THRESHOLD", 245),
+    )
+
+    # Step 4 – pigment extraction
+    mask_pigment, mask_white_final, img_hsv = extract_pigment_pixels(
+        img_rgb_final, shell_mask, config
+    )
 
     return {
         "file": file_path,
@@ -386,6 +535,7 @@ def preprocess_image(file_path, config):
         "white_count": int(cv2.countNonZero(mask_white_final)),
         "pigment_count": int(cv2.countNonZero(mask_pigment)),
         "pigment_pixels": img_rgb_final[mask_pigment > 0],
+        "canvas_size": target_size,
     }
 
 
@@ -737,14 +887,32 @@ def train_shell_model(folder_path, config=None, model_path="trained_shell_model.
 # ============================================================
 # CONFIDENCE AND ERROR METRICS
 # ============================================================
-def compute_moe(pixels_rgb, center_rgb):
+def compute_moe(pixels_rgb, center_rgb, canvas_size=1000):
     """
     Compute margin of error for a color cluster.
 
+    Parameters
+    ----------
+    pixels_rgb : np.ndarray, shape (N, 3)
+        RGB pixel values in the cluster.
+    center_rgb : array-like, shape (3,)
+        Cluster centroid in RGB.
+    canvas_size : int
+        Normalised canvas side length (default 1000).  Defines the scale
+        reference for ``moe_rgb_pct`` so that margins are expressed relative
+        to the standard 1000×1000 image dimension rather than the full
+        0-255 colour range.  Formula:
+        ``moe_rgb_pct = mean_channel_std / canvas_size * 100``.
+
     Returns
     -------
-    moe_lab : float - std dev of CIELAB distances from pixels to centroid
-    moe_rgb_pct : float - mean RGB channel std dev as % of full range (255)
+    moe_lab : float
+        Standard deviation of per-pixel CIELAB distances to the centroid.
+    moe_rgb_pct : float
+        Mean RGB channel standard deviation expressed as a scale-aware
+        percentage of the normalised canvas dimension.
+        This follows the specification: (colour variation / canvas_size) × 100 %.
+        Example: mean channel std of ±50 units on a 1000-unit canvas → 5.0 %.
     """
     if len(pixels_rgb) == 0:
         return 0.0, 0.0
@@ -753,7 +921,9 @@ def compute_moe(pixels_rgb, center_rgb):
     dists = np.linalg.norm(pixels_lab - center_lab, axis=1)
     moe_lab = float(np.std(dists))
     rgb_std = np.std(pixels_rgb, axis=0)
-    moe_rgb_pct = float(np.mean(rgb_std) / 255.0 * 100.0)
+    # Scale-aware: normalise by canvas_size (not 255) so the percentage
+    # reflects variation relative to the normalised image dimension.
+    moe_rgb_pct = float(np.mean(rgb_std) / canvas_size * 100.0)
     return moe_lab, moe_rgb_pct
 
 
@@ -828,7 +998,10 @@ class SelfLearningAnalyzer:
             color_name = self.model.centroid_names[nearest_idx]
             confidence = self.model.compute_confidence(dist)
             cluster_pixels = pixel_stack[labels == cluster_idx]
-            moe_lab, moe_rgb_pct = compute_moe(cluster_pixels, center)
+            moe_lab, moe_rgb_pct = compute_moe(
+                cluster_pixels, center,
+                canvas_size=self.config.get("STANDARD_CANVAS_SIZE", 1000),
+            )
             rgb = np.clip(center, 0, 255).astype(np.uint8)
             results.append({
                 "center_rgb": rgb,
@@ -895,7 +1068,10 @@ class SelfLearningAnalyzer:
             mask = full_assign == idx
             cluster_pixels = pixel_stack[mask]
             confidence = compute_cohesion_confidence(cluster_pixels, center, scale)
-            moe_lab, moe_rgb_pct = compute_moe(cluster_pixels, center)
+            moe_lab, moe_rgb_pct = compute_moe(
+                cluster_pixels, center,
+                canvas_size=self.config.get("STANDARD_CANVAS_SIZE", 1000),
+            )
             rgb = np.clip(center, 0, 255).astype(np.uint8)
             dist_to_centroid = None
             if self.model and self.model.centroids_lab is not None:
@@ -914,12 +1090,27 @@ class SelfLearningAnalyzer:
             })
         return results, k_metrics, linkage_matrix, h_thresh, h_sample
 
-    def combine_results(self, trained_results, fresh_results, total_pigment_pixels):
+    def combine_results(self, trained_results, fresh_results, total_pigment_pixels,
+                        canvas_size=1000):
         """
         Reconcile trained and fresh results into a single ranked color list.
         Colors are matched by nearest CIELAB distance (threshold = _LAB_MATCH_THRESHOLD deltaE).
+
+        Parameters
+        ----------
+        trained_results : list
+            Output of :meth:`analyze_trained_method`.
+        fresh_results : list
+            Output of :meth:`analyze_fresh_method`.
+        total_pigment_pixels : int
+            Total number of pigmented pixels analysed.
+        canvas_size : int
+            Side length of the normalised canvas (default 1000).  Used to
+            compute ``area_normalized_pct`` for each detected colour:
+            ``count / (canvas_size ** 2) * 100``.
         """
         LAB_MATCH_THRESH = _LAB_MATCH_THRESHOLD
+        total_canvas_pixels = canvas_size * canvas_size
 
         def _to_lab(r):
             return rgb_to_lab(r["center_rgb"])
@@ -932,6 +1123,7 @@ class SelfLearningAnalyzer:
                 sorted(fresh_results, key=lambda x: x["count"], reverse=True), 1
             ):
                 pct = r["count"] / max(total_pigment_pixels, 1) * 100.0
+                area_pct = r["count"] / max(total_canvas_pixels, 1) * 100.0
                 combined.append({
                     "rank": rank,
                     "role": "BASE" if rank == 1 else "SECONDARY",
@@ -940,6 +1132,7 @@ class SelfLearningAnalyzer:
                     "hex": r["hex"],
                     "count": r["count"],
                     "pct_of_pigment": round(pct, 2),
+                    "area_normalized_pct": round(area_pct, 2),
                     "confidence_trained": None,
                     "confidence_fresh": r.get("confidence_fresh"),
                     "combined_confidence": r.get("confidence_fresh"),
@@ -1009,13 +1202,15 @@ class SelfLearningAnalyzer:
                     "suggested_method": "Fresh",
                 })
 
-        # Sort by count descending, assign rank
+        # Sort by count descending, assign rank and area metrics
         rows = sorted(rows, key=lambda x: x["count"], reverse=True)
         for rank, row in enumerate(rows, 1):
             pct = row["count"] / max(total_pigment_pixels, 1) * 100.0
+            area_pct = row["count"] / max(total_canvas_pixels, 1) * 100.0
             row["rank"] = rank
             row["role"] = "BASE" if rank == 1 else "SECONDARY"
             row["pct_of_pigment"] = round(pct, 2)
+            row["area_normalized_pct"] = round(area_pct, 2)
         return rows
 
 
@@ -1026,11 +1221,11 @@ def print_color_table(colors):
     """Print formatted color result table to console."""
     if not colors:
         return
-    sep = "=" * 108
+    sep = "=" * 122
     print(f"\n{sep}")
     print(
         f"  {'RNK':<4} {'ROLE':<10} {'COLOR NAME':<22} {'HEX':<9} "
-        f"{'%PIGm':>6} {'CONF-T':>7} {'CONF-F':>7} {'COMB':>6} "
+        f"{'%PIGm':>6} {'AREA%':>6} {'CONF-T':>7} {'CONF-F':>7} {'COMB':>6} "
         f"{'DIST-dE':>8} {'MoE-dE':>7} {'MoE-RGB%':>9} {'HIGHER METHOD'}"
     )
     print(sep)
@@ -1040,6 +1235,7 @@ def print_color_table(colors):
         print(
             f"  {c['rank']:<4} {c['role']:<10} {c['name']:<22} {c['hex']:<9} "
             f"{c['pct_of_pigment']:>5.1f}% "
+            f"{_f(c.get('area_normalized_pct')):>6} "
             f"{_f(c.get('confidence_trained')):>7} "
             f"{_f(c.get('confidence_fresh')):>7} "
             f"{_f(c.get('combined_confidence')):>6} "
@@ -1057,7 +1253,7 @@ def export_results(combined_colors, output_folder, timestamp):
 
     fieldnames = [
         "rank", "role", "name", "hex", "rgb",
-        "pct_of_pigment",
+        "pct_of_pigment", "area_normalized_pct",
         "confidence_trained", "confidence_fresh", "combined_confidence",
         "distance_to_centroid_lab", "moe_lab", "moe_rgb_pct",
         "higher_confidence_method", "suggested_method",
@@ -1572,7 +1768,10 @@ def run_analysis_mode(folder_path, config, model=None, output_folder="./output",
     fresh_colors_pie = _enrich(fresh_results, "confidence_fresh")
 
     # Combined results
-    combined = analyzer.combine_results(trained_results, fresh_results, total_pix)
+    combined = analyzer.combine_results(
+        trained_results, fresh_results, total_pix,
+        canvas_size=config.get("STANDARD_CANVAS_SIZE", 1000),
+    )
 
     # Console output
     print_color_table(combined)
