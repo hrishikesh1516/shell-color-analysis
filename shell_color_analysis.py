@@ -2,7 +2,8 @@
 Self-Learning Shell Color Analysis System
 ==========================================
 A complete self-learning color analysis framework for shell organisms
-(bivalves and gastropods) using K-Means and Hierarchical clustering.
+(bivalves and gastropods) using Hierarchical clustering as primary method
+and K-Means as secondary comparison.
 
 The system operates in two main modes:
 
@@ -17,15 +18,16 @@ ANALYSIS MODE  (analyzes images using trained knowledge):
 Training produces trained_shell_model.pkl which stores:
   - Trained color centroids (RGB and CIELAB)
   - Color statistics (mean, std, min, max per centroid)
-  - Optimal parameters (K_MIN, K_MAX, merge thresholds, hierarchical percentile)
+  - Optimal hierarchical parameters (linkage method, distance percentile, merge threshold)
+  - Color count statistics (min, max, mean, median colors discovered per sample)
   - Training metadata and validation metrics
 
 Analysis provides two result sets per image:
-  - Method 1 (Trained) : matches detected colors to trained centroids,
-                          confidence based on CIELAB distance
-  - Method 2 (Fresh)   : fresh clustering using learned optimal parameters,
-                          confidence based on cluster cohesion
-  - Combined           : mean-average of both methods with method comparison
+  - Method 1 (Hierarchical Primary) : hierarchical clustering with learned parameters,
+                                      confidence = silhouette×0.7 + centroid_distance×0.3
+  - Method 2 (K-Means Secondary)   : K-Means with K estimated from training statistics,
+                                      confidence based on cluster cohesion
+  - Combined                        : mean-average of both methods with method comparison
 
 See COMMANDS.md for a complete quick-reference.
 """
@@ -49,10 +51,15 @@ import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
 import numpy as np
 from PIL import Image
-from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
 from scipy.spatial.distance import pdist
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.metrics import (
+    silhouette_score,
+    silhouette_samples,
+    davies_bouldin_score,
+    calinski_harabasz_score,
+)
 
 try:
     from rembg import remove as rembg_remove
@@ -255,21 +262,62 @@ def find_optimal_k(pixels, k_min=5, k_max=20, sample_size=5000, random_state=42)
 # HIERARCHICAL CLUSTERING
 # ============================================================
 def hierarchical_color_clustering(pixels, distance_percentile=85,
+                                   linkage_method="ward",
                                    sample_size=3000, random_state=42):
-    """Agglomerative hierarchical clustering with adaptive distance threshold."""
-    logger.info("  Running Hierarchical (Agglomerative) Clustering...")
+    """Agglomerative hierarchical clustering with adaptive distance threshold.
+
+    Parameters
+    ----------
+    pixels : np.ndarray, shape (N, 3)
+        RGB pixel data to cluster.
+    distance_percentile : int
+        Percentile of pairwise distances used to cut the dendrogram.
+    linkage_method : str
+        Linkage method for :func:`scipy.cluster.hierarchy.linkage`
+        (``'ward'`` or ``'complete'``).
+    sample_size : int
+        Maximum number of pixels to sample for clustering.
+    random_state : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    centers : np.ndarray, shape (K, 3)
+        Cluster centroids in RGB.
+    counts : list of int
+        Pixel count per cluster.
+    cut_height : float
+        Dendrogram cut height used.
+    Z : np.ndarray
+        Linkage matrix from :func:`scipy.cluster.hierarchy.linkage`.
+    sample : np.ndarray
+        The pixel sample used for clustering.
+    sil_score : float
+        Mean silhouette score on the sample (NaN if < 2 clusters).
+    """
+    logger.info(f"  Running Hierarchical Clustering (method={linkage_method})...")
     if len(pixels) > sample_size:
         idx = np.random.RandomState(random_state).choice(len(pixels), sample_size, replace=False)
         sample = pixels[idx]
     else:
         sample = pixels
 
-    Z = linkage(sample, method="ward")
+    Z = linkage(sample, method=linkage_method)
     pairwise_dists = pdist(sample)
     cut_height = float(np.percentile(pairwise_dists, distance_percentile))
     labels = fcluster(Z, t=cut_height, criterion="distance") - 1
     unique_labels = np.unique(labels)
     sample_centers = np.array([sample[labels == k].mean(axis=0) for k in unique_labels])
+
+    # Compute silhouette score on the sample
+    n_clusters = len(unique_labels)
+    if n_clusters >= 2 and len(sample) >= n_clusters:
+        try:
+            sil_score = float(silhouette_score(sample, labels))
+        except Exception:
+            sil_score = float("nan")
+    else:
+        sil_score = float("nan")
 
     diffs = pixels[:, np.newaxis, :] - sample_centers[np.newaxis, :, :]
     full_labels = np.argmin(np.linalg.norm(diffs, axis=2), axis=1)
@@ -283,9 +331,83 @@ def hierarchical_color_clustering(pixels, distance_percentile=85,
 
     logger.info(
         f"  Hierarchical: {len(centers)} clusters "
-        f"(cut_height={cut_height:.1f})"
+        f"(cut_height={cut_height:.1f}, sil={sil_score:.3f})"
     )
-    return np.array(centers), counts, cut_height, Z, sample
+    return np.array(centers), counts, cut_height, Z, sample, sil_score
+
+
+def find_optimal_hierarchical_params(pixels, sample_size=3000, random_state=42):
+    """
+    Auto-discover the best hierarchical linkage method and distance percentile.
+
+    Tests ``'ward'`` and ``'complete'`` linkage methods across a range of
+    distance percentiles and selects the combination that maximises the mean
+    silhouette score.  This lets the training phase discover natural color
+    groups **without any manual K selection**.
+
+    Parameters
+    ----------
+    pixels : np.ndarray, shape (N, 3)
+        RGB pixel data to cluster.
+    sample_size : int
+        Maximum pixels to sample for the parameter search.
+    random_state : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    best_linkage : str
+        The linkage method with the best overall silhouette score.
+    best_percentile : int
+        The distance percentile that produced the best silhouette score.
+    best_n_clusters : int
+        Number of clusters found with the optimal parameters.
+    best_sil : float
+        Best silhouette score achieved.
+    """
+    if len(pixels) > sample_size:
+        idx = np.random.RandomState(random_state).choice(len(pixels), sample_size, replace=False)
+        sample = pixels[idx]
+    else:
+        sample = pixels
+
+    linkage_methods = ["ward", "complete"]
+    percentile_candidates = [60, 65, 70, 75, 80, 85, 90, 95]
+
+    best_linkage = "ward"
+    best_percentile = 85
+    best_sil = -2.0
+    best_n_clusters = 2
+
+    pairwise_dists = pdist(sample)
+
+    for method in linkage_methods:
+        try:
+            Z = linkage(sample, method=method)
+        except Exception:
+            continue
+        for pct in percentile_candidates:
+            cut_height = float(np.percentile(pairwise_dists, pct))
+            labels = fcluster(Z, t=cut_height, criterion="distance") - 1
+            n_clusters = len(np.unique(labels))
+            if n_clusters < 2 or n_clusters >= len(sample):
+                continue
+            try:
+                sil = float(silhouette_score(sample, labels))
+            except Exception:
+                continue
+            if sil > best_sil:
+                best_sil = sil
+                best_linkage = method
+                best_percentile = pct
+                best_n_clusters = n_clusters
+
+    logger.info(
+        f"  Optimal hierarchical params: method={best_linkage}, "
+        f"percentile={best_percentile}, n_clusters={best_n_clusters}, "
+        f"sil={best_sil:.3f}"
+    )
+    return best_linkage, best_percentile, best_n_clusters, best_sil
 
 
 # ============================================================
@@ -560,18 +682,28 @@ class TrainedShellModel:
         # Per-centroid pixel statistics (list of dicts)
         self.centroid_stats = []
 
-        # Learned optimal parameters
-        self.k_min = 3
-        self.k_max = 15
+        # Learned optimal hierarchical parameters (primary method)
+        self.linkage_method = "ward"     # 'ward' or 'complete'
+        self.hierarchical_percentile = 85
         self.merge_threshold = None
         self.merge_percentile = 30
-        self.hierarchical_percentile = 85
         self.confidence_scale = 25.0    # CIELAB units
+
+        # Color count statistics discovered by hierarchical clustering
+        self.min_colors = 2
+        self.max_colors = 15
+        self.mean_colors = 5.0
+        self.median_colors = 5.0
+
+        # K-Means secondary parameters (estimated from color stats)
+        self.k_min = 3
+        self.k_max = 15
 
         # Training metadata
         self.n_training_samples = 0
         self.training_date = None
-        self.k_values_found = []
+        self.k_values_found = []        # kept for backward compatibility
+        self.n_colors_found = []        # colors per sample from hierarchical clustering
         self.per_sample_colors = []     # list of per-sample results (for retraining)
 
         # Validation metrics (populated after training)
@@ -631,7 +763,6 @@ def _collect_training_centroids(folder_path, config, existing_colors=None):
     logger.info(f"Found {len(image_files)} training image(s) in: {folder_path}")
 
     merge_pct_candidates = [15, 20, 25, 30, 35, 40]
-    hier_pct_candidates = [70, 75, 80, 85, 90, 95]
 
     sample_results = []
     for i, file in enumerate(image_files):
@@ -644,49 +775,48 @@ def _collect_training_centroids(folder_path, config, existing_colors=None):
 
         pixels = data["pigment_pixels"].astype(float)
 
-        # Find optimal K
-        best_k, k_metrics = find_optimal_k(pixels, k_min=2, k_max=20)
-        logger.info(f"    Optimal K = {best_k}")
+        # PRIMARY: Hierarchical clustering auto-discovers natural color groups
+        # (no manual K selection required)
+        best_linkage, best_hp, best_n_colors, best_sil = find_optimal_hierarchical_params(pixels)
+        logger.info(
+            f"    Hierarchical primary: linkage={best_linkage}, "
+            f"percentile={best_hp}, n_colors={best_n_colors}, sil={best_sil:.3f}"
+        )
 
-        # K-Means with optimal K
-        centers, counts, labels = kmeans_color_clustering(pixels, best_k)
+        # Run hierarchical with optimal params to get final centroids
+        # ALL colors are captured here (including <1% coverage)
+        h_centers, h_counts, h_thresh, _, _, _ = hierarchical_color_clustering(
+            pixels, distance_percentile=best_hp, linkage_method=best_linkage
+        )
 
-        # Best merge percentile
+        # Best merge percentile (applied after hierarchical clustering)
         best_mp = config["COLOR_MERGE_PERCENTILE"]
         best_thresh = 15.0
         best_mp_score = float("inf")
         for mp in merge_pct_candidates:
-            thresh = compute_adaptive_merge_threshold(centers, mp)
-            merged_c, _ = merge_similar_clusters(centers, counts, thresh)
-            score = -len(merged_c)
-            if score < best_mp_score:
-                best_mp_score = score
+            thresh = compute_adaptive_merge_threshold(h_centers, mp)
+            merged_c, _ = merge_similar_clusters(h_centers, h_counts, thresh)
+            # Prefer merge threshold that best preserves all natural color groups
+            deviation = abs(len(merged_c) - best_n_colors)
+            if deviation < best_mp_score:
+                best_mp_score = deviation
                 best_mp = mp
                 best_thresh = thresh
-        final_centers, final_counts = merge_similar_clusters(centers, counts, best_thresh)
+        final_centers, final_counts = merge_similar_clusters(h_centers, h_counts, best_thresh)
         logger.info(f"    Merge pct={best_mp}, threshold={best_thresh:.2f}, "
                     f"final clusters={len(final_centers)}")
 
-        # Best hierarchical percentile
-        best_hp = config["HIERARCHICAL_DISTANCE_PERCENTILE"]
-        best_hp_score = float("inf")
-        for hp in hier_pct_candidates:
-            h_c, _, _, _, _ = hierarchical_color_clustering(pixels, distance_percentile=hp)
-            score = abs(len(h_c) - best_k)
-            if score < best_hp_score:
-                best_hp_score = score
-                best_hp = hp
-        logger.info(f"    Hierarchical percentile={best_hp}")
-
         sample_results.append({
             "file": file,
-            "optimal_k": best_k,
+            "n_colors": len(final_centers),       # hierarchical discovered colors
+            "optimal_k": len(final_centers),       # kept for backward compatibility
+            "linkage_method": best_linkage,
+            "hier_percentile": best_hp,
+            "hier_silhouette": best_sil,
             "centers_rgb": final_centers,
             "counts": final_counts,
             "merge_threshold": best_thresh,
             "merge_percentile": best_mp,
-            "hier_percentile": best_hp,
-            "k_metrics": k_metrics,
         })
 
     if existing_colors:
@@ -845,10 +975,31 @@ def train_shell_model(folder_path, config=None, model_path="trained_shell_model.
     model.n_training_samples = len(sample_results)
     model.training_date = datetime.now().isoformat()
 
-    k_vals = [sr["optimal_k"] for sr in sample_results]
-    model.k_values_found = k_vals
-    model.k_min = max(2, int(np.percentile(k_vals, 10)))
-    model.k_max = int(np.percentile(k_vals, 90)) + 2
+    # Collect color counts discovered by hierarchical clustering
+    n_colors_list = [sr.get("n_colors", sr.get("optimal_k", 2)) for sr in sample_results]
+    model.n_colors_found = n_colors_list
+    model.k_values_found = n_colors_list           # backward compatibility alias
+
+    # Color count statistics (learned from hierarchical discovery)
+    model.min_colors = int(np.min(n_colors_list))
+    model.max_colors = int(np.max(n_colors_list))
+    model.mean_colors = float(np.mean(n_colors_list))
+    model.median_colors = float(np.median(n_colors_list))
+
+    # K-Means secondary range estimated from hierarchical color count stats
+    model.k_min = max(2, int(np.percentile(n_colors_list, 10)))
+    model.k_max = int(np.percentile(n_colors_list, 90)) + 2
+
+    # Select the linkage method that was most frequently best across samples
+    linkage_votes = [sr.get("linkage_method", "ward") for sr in sample_results]
+    ward_votes = linkage_votes.count("ward")
+    complete_votes = linkage_votes.count("complete")
+    model.linkage_method = "ward" if ward_votes >= complete_votes else "complete"
+    logger.info(
+        f"  Linkage method selection: ward={ward_votes}, "
+        f"complete={complete_votes} → '{model.linkage_method}'"
+    )
+
     model.merge_percentile = int(round(float(np.mean([sr["merge_percentile"] for sr in sample_results]))))
     model.hierarchical_percentile = int(round(float(np.mean([sr["hier_percentile"] for sr in sample_results]))))
     model.merge_threshold = float(np.mean([sr["merge_threshold"] for sr in sample_results]))
@@ -868,12 +1019,17 @@ def train_shell_model(folder_path, config=None, model_path="trained_shell_model.
     logger.info("  TRAINING COMPLETE")
     logger.info(f"{'='*60}")
     logger.info(f"  Training samples    : {model.n_training_samples}")
-    logger.info(f"  K values found      : {model.k_values_found}")
-    logger.info(f"  Learned K_MIN       : {model.k_min}")
-    logger.info(f"  Learned K_MAX       : {model.k_max}")
+    logger.info(f"  Colors per sample   : {model.n_colors_found}")
+    logger.info(f"  Min colors          : {model.min_colors}")
+    logger.info(f"  Max colors          : {model.max_colors}")
+    logger.info(f"  Mean colors         : {model.mean_colors:.1f}")
+    logger.info(f"  Median colors       : {model.median_colors:.1f}")
+    logger.info(f"  Linkage method      : {model.linkage_method}")
+    logger.info(f"  Hier. percentile    : {model.hierarchical_percentile}")
     logger.info(f"  Merge percentile    : {model.merge_percentile}")
     logger.info(f"  Merge threshold     : {model.merge_threshold:.2f}")
-    logger.info(f"  Hier. percentile    : {model.hierarchical_percentile}")
+    logger.info(f"  K-Means K_MIN       : {model.k_min}")
+    logger.info(f"  K-Means K_MAX       : {model.k_max}")
     logger.info(f"  Confidence scale    : {model.confidence_scale:.2f} CIELAB units")
     logger.info(f"  Trained centroids   : {len(model.centroids_rgb)}")
     logger.info(f"  Training accuracy   : {model.training_accuracy:.1f}%")
@@ -944,13 +1100,17 @@ class SelfLearningAnalyzer:
     """
     Runs two complementary color analysis methods and combines the results.
 
-    Method 1 (Trained):
-        Clusters pixels then matches each cluster to the nearest trained centroid.
-        Confidence = 100 * exp(-CIELAB_distance / confidence_scale).
+    Method 1 (Hierarchical Primary):
+        Hierarchical clustering with learned linkage method and distance percentile.
+        Clusters are matched to the nearest trained centroid.
+        Confidence = silhouette_confidence × 0.7 + centroid_confidence × 0.3
+          where silhouette_confidence = (silhouette_score + 1) / 2 × 100
+          and   centroid_confidence   = 100 × exp(-CIELAB_distance / confidence_scale).
 
-    Method 2 (Fresh):
-        Fresh K-Means + Hierarchical clustering using learned optimal parameters.
+    Method 2 (K-Means Secondary):
+        Fresh K-Means with K estimated from model.mean_colors.
         Confidence = 100 * exp(-mean_intra_cluster_CIELAB_distance / scale).
+        Used for comparison only.
     """
 
     def __init__(self, model=None, config=None):
@@ -968,63 +1128,156 @@ class SelfLearningAnalyzer:
         self.config["HIERARCHICAL_DISTANCE_PERCENTILE"] = self.model.hierarchical_percentile
         if self.model.merge_threshold is not None:
             self.config["COLOR_MERGE_THRESHOLD"] = self.model.merge_threshold
+        # Propagate learned linkage method
+        self.config["HIERARCHICAL_LINKAGE_METHOD"] = getattr(
+            self.model, "linkage_method", "ward"
+        )
 
-    def analyze_trained_method(self, pixel_stack):
+    def analyze_hierarchical_method(self, pixel_stack):
         """
-        Method 1: K-Means clustering whose clusters are matched to trained centroids.
-        Returns list of color result dicts.
-        """
-        if self.model is None or self.model.centroids_rgb is None:
-            return []
+        Method 1 (Primary): Hierarchical clustering with learned parameters.
 
-        if self.model.k_values_found:
-            optimal_k = max(
-                self.config["NUM_CLUSTERS_MIN"],
-                min(
-                    int(round(float(np.mean(self.model.k_values_found)))),
-                    self.config["NUM_CLUSTERS_MAX"],
-                ),
-            )
+        Uses the linkage method and distance percentile learned during training
+        to discover natural color groups.  Each cluster is then matched to the
+        nearest trained centroid (if a model is available) to assign a name.
+
+        Confidence = silhouette_confidence × 0.7 + centroid_confidence × 0.3
+
+        Returns
+        -------
+        results : list of dict
+        linkage_matrix : np.ndarray or None
+        h_sample : np.ndarray or None
+        """
+        linkage_method = self.config.get("HIERARCHICAL_LINKAGE_METHOD", "ward")
+        hier_pct = self.config.get("HIERARCHICAL_DISTANCE_PERCENTILE", 85)
+        merge_thresh = self.config.get("COLOR_MERGE_THRESHOLD") or compute_adaptive_merge_threshold(
+            np.zeros((2, 3)), self.config["COLOR_MERGE_PERCENTILE"]
+        )
+        canvas_size = self.config.get("STANDARD_CANVAS_SIZE", 1000)
+        scale = (
+            self.model.confidence_scale if self.model else
+            self.config.get("CONFIDENCE_SCALE_LAB", 25.0)
+        )
+
+        centers, counts, h_cut, Z, h_sample, sil_overall = hierarchical_color_clustering(
+            pixel_stack,
+            distance_percentile=hier_pct,
+            linkage_method=linkage_method,
+        )
+
+        if len(centers) == 0:
+            return [], None, None
+
+        # Recompute merge threshold from actual hierarchical centers
+        merge_thresh = (
+            self.config.get("COLOR_MERGE_THRESHOLD")
+            or compute_adaptive_merge_threshold(centers, self.config["COLOR_MERGE_PERCENTILE"])
+        )
+        centers_m, counts_m = merge_similar_clusters(centers, counts, merge_thresh)
+
+        # Assign all pixels to nearest merged center and compute per-cluster silhouette
+        centers_lab = pixels_rgb_to_lab(centers_m)
+        all_labs = pixels_rgb_to_lab(pixel_stack)
+        diffs = all_labs[:, np.newaxis, :] - centers_lab[np.newaxis, :, :]
+        full_labels = np.argmin(np.linalg.norm(diffs, axis=2), axis=1)
+
+        n_clusters = len(centers_m)
+        # Compute per-cluster mean silhouette scores (require ≥ 2 clusters)
+        if n_clusters >= 2 and len(pixel_stack) >= n_clusters:
+            sample_size = min(3000, len(pixel_stack))
+            idx = np.random.RandomState(42).choice(len(pixel_stack), sample_size, replace=False)
+            sil_samples = silhouette_samples(all_labs[idx], full_labels[idx])
+            per_cluster_sil = []
+            for k in range(n_clusters):
+                mask_k = full_labels[idx] == k
+                if mask_k.any():
+                    val = float(np.nanmean(sil_samples[mask_k]))
+                    per_cluster_sil.append(0.0 if np.isnan(val) else val)
+                else:
+                    per_cluster_sil.append(0.0)
+            per_cluster_sil = np.array(per_cluster_sil)
         else:
-            optimal_k = self.config["NUM_CLUSTERS_MIN"]
-
-        centers, counts, labels = kmeans_color_clustering(pixel_stack, optimal_k)
-        scale = self.model.confidence_scale
+            per_cluster_sil = np.zeros(n_clusters)
 
         results = []
-        for cluster_idx, (center, count) in enumerate(zip(centers, counts)):
-            center_lab = rgb_to_lab(center)
-            nearest_idx, dist = self.model.find_nearest_centroid(center_lab)
-            color_name = self.model.centroid_names[nearest_idx]
-            confidence = self.model.compute_confidence(dist)
-            cluster_pixels = pixel_stack[labels == cluster_idx]
-            moe_lab, moe_rgb_pct = compute_moe(
-                cluster_pixels, center,
-                canvas_size=self.config.get("STANDARD_CANVAS_SIZE", 1000),
-            )
+        for cluster_idx, (center, count) in enumerate(zip(centers_m, counts_m)):
             rgb = np.clip(center, 0, 255).astype(np.uint8)
+            cluster_pixels = pixel_stack[full_labels == cluster_idx]
+
+            # Silhouette component: convert from [-1, 1] to [0, 100]
+            sil_val = float(per_cluster_sil[cluster_idx])
+            sil_confidence = (sil_val + 1.0) / 2.0 * 100.0
+
+            # Centroid distance component (if model available)
+            dist_to_centroid = None
+            color_name = get_closest_color_name(rgb)
+            centroid_confidence = sil_confidence  # fallback if no model
+            if self.model is not None and self.model.centroids_lab is not None:
+                center_lab = rgb_to_lab(rgb)
+                nearest_idx, dist = self.model.find_nearest_centroid(center_lab)
+                dist_to_centroid = round(float(dist), 2)
+                centroid_confidence = self.model.compute_confidence(dist)
+                color_name = self.model.centroid_names[nearest_idx]
+
+            # Combined confidence: silhouette 70% + centroid distance 30%
+            confidence_hierarchical = round(
+                sil_confidence * 0.7 + centroid_confidence * 0.3, 1
+            )
+
+            moe_lab, moe_rgb_pct = compute_moe(cluster_pixels, center, canvas_size=canvas_size)
             results.append({
                 "center_rgb": rgb,
                 "count": int(count),
                 "name": color_name,
                 "hex": "#{:02x}{:02x}{:02x}".format(*rgb),
-                "confidence_trained": round(confidence, 1),
-                "distance_to_centroid_lab": round(dist, 2),
+                "confidence_hierarchical": confidence_hierarchical,
+                "silhouette_confidence": round(sil_confidence, 1),
+                "centroid_confidence": round(centroid_confidence, 1),
+                "distance_to_centroid_lab": dist_to_centroid,
                 "moe_lab": round(moe_lab, 2),
                 "moe_rgb_pct": round(moe_rgb_pct, 2),
             })
+        return results, Z, h_sample
+
+    # Keep backward-compatible alias used by old model/code paths
+    def analyze_trained_method(self, pixel_stack):
+        """Backward-compatible alias for :meth:`analyze_hierarchical_method`."""
+        out = self.analyze_hierarchical_method(pixel_stack)
+        results = out[0] if out else []
+        # Translate key name for combine_results compatibility
+        for r in results:
+            r.setdefault("confidence_trained", r.get("confidence_hierarchical"))
         return results
 
     def analyze_fresh_method(self, pixel_stack):
         """
-        Method 2: Fresh K-Means + Hierarchical with learned optimal parameters.
-        Returns (color_results_list, k_metrics, linkage_matrix, h_cut_height, h_sample).
-        """
-        k_min = self.config["NUM_CLUSTERS_MIN"]
-        k_max = self.config["NUM_CLUSTERS_MAX"]
-        optimal_k, k_metrics = find_optimal_k(pixel_stack, k_min=k_min, k_max=k_max)
+        Method 2 (Secondary): Fresh K-Means for comparison only.
 
-        # K-Means
+        K is estimated from ``model.mean_colors`` (learned during training).
+        If no model is loaded, falls back to the configured K range.
+
+        Returns
+        -------
+        (results, k_metrics)
+        """
+        # Estimate K from training statistics (mean_colors)
+        if self.model is not None and hasattr(self.model, "mean_colors"):
+            optimal_k = max(
+                self.config["NUM_CLUSTERS_MIN"],
+                min(
+                    int(round(self.model.mean_colors)),
+                    self.config["NUM_CLUSTERS_MAX"],
+                ),
+            )
+            k_metrics = {"optimal_k": optimal_k}
+        else:
+            k_min = self.config["NUM_CLUSTERS_MIN"]
+            k_max = self.config["NUM_CLUSTERS_MAX"]
+            optimal_k, k_metrics = find_optimal_k(pixel_stack, k_min=k_min, k_max=k_max)
+
+        logger.info(f"  [K-Means Secondary] K={optimal_k}")
+
         km_centers, km_counts, km_labels = kmeans_color_clustering(pixel_stack, optimal_k)
         merge_thresh = (
             self.config.get("COLOR_MERGE_THRESHOLD")
@@ -1032,46 +1285,22 @@ class SelfLearningAnalyzer:
         )
         km_centers_m, km_counts_m = merge_similar_clusters(km_centers, km_counts, merge_thresh)
 
-        # Hierarchical
-        h_centers, h_counts, h_thresh, linkage_matrix, h_sample = hierarchical_color_clustering(
-            pixel_stack,
-            distance_percentile=self.config["HIERARCHICAL_DISTANCE_PERCENTILE"],
-        )
-        h_merge_thresh = (
-            self.config.get("COLOR_MERGE_THRESHOLD")
-            or compute_adaptive_merge_threshold(h_centers, self.config["COLOR_MERGE_PERCENTILE"])
-        )
-        h_centers_m, h_counts_m = merge_similar_clusters(h_centers, h_counts, h_merge_thresh)
-
-        # Combine K-Means + Hierarchical (merge both sets together)
-        combined_rgb = list(km_centers_m) + list(h_centers_m)
-        combined_counts = list(km_counts_m) + list(h_counts_m)
-        if combined_rgb:
-            combined_rgb_arr = np.array(combined_rgb)
-            combined_rgb_arr, combined_counts = merge_similar_clusters(
-                combined_rgb_arr, combined_counts, merge_thresh
-            )
-        else:
-            return [], k_metrics, linkage_matrix, h_thresh, h_sample
-
         scale = (self.model.confidence_scale if self.model else
                  self.config.get("CONFIDENCE_SCALE_LAB", 25.0))
+        canvas_size = self.config.get("STANDARD_CANVAS_SIZE", 1000)
 
-        # Assign all pixels to nearest combined centre
-        combined_labs = pixels_rgb_to_lab(combined_rgb_arr)
+        # Assign all pixels to nearest merged center
+        centers_lab = pixels_rgb_to_lab(km_centers_m)
         all_labs = pixels_rgb_to_lab(pixel_stack)
-        diffs = all_labs[:, np.newaxis, :] - combined_labs[np.newaxis, :, :]
+        diffs = all_labs[:, np.newaxis, :] - centers_lab[np.newaxis, :, :]
         full_assign = np.argmin(np.linalg.norm(diffs, axis=2), axis=1)
 
         results = []
-        for idx, (center, count) in enumerate(zip(combined_rgb_arr, combined_counts)):
+        for idx, (center, count) in enumerate(zip(km_centers_m, km_counts_m)):
             mask = full_assign == idx
             cluster_pixels = pixel_stack[mask]
             confidence = compute_cohesion_confidence(cluster_pixels, center, scale)
-            moe_lab, moe_rgb_pct = compute_moe(
-                cluster_pixels, center,
-                canvas_size=self.config.get("STANDARD_CANVAS_SIZE", 1000),
-            )
+            moe_lab, moe_rgb_pct = compute_moe(cluster_pixels, center, canvas_size=canvas_size)
             rgb = np.clip(center, 0, 255).astype(np.uint8)
             dist_to_centroid = None
             if self.model and self.model.centroids_lab is not None:
@@ -1084,30 +1313,32 @@ class SelfLearningAnalyzer:
                 "name": get_closest_color_name(rgb),
                 "hex": "#{:02x}{:02x}{:02x}".format(*rgb),
                 "confidence_fresh": round(confidence, 1),
+                "confidence_kmeans": round(confidence, 1),
                 "distance_to_centroid_lab": dist_to_centroid,
                 "moe_lab": round(moe_lab, 2),
                 "moe_rgb_pct": round(moe_rgb_pct, 2),
             })
-        return results, k_metrics, linkage_matrix, h_thresh, h_sample
+        return results, k_metrics
 
-    def combine_results(self, trained_results, fresh_results, total_pigment_pixels,
+    def combine_results(self, hier_results, kmeans_results, total_pigment_pixels,
                         canvas_size=1000):
         """
-        Reconcile trained and fresh results into a single ranked color list.
-        Colors are matched by nearest CIELAB distance (threshold = _LAB_MATCH_THRESHOLD deltaE).
+        Reconcile hierarchical (primary) and K-Means (secondary) results into a
+        single ranked color list.
+
+        Colors from both methods are matched by nearest CIELAB distance
+        (threshold = _LAB_MATCH_THRESHOLD deltaE).
 
         Parameters
         ----------
-        trained_results : list
-            Output of :meth:`analyze_trained_method`.
-        fresh_results : list
-            Output of :meth:`analyze_fresh_method`.
+        hier_results : list
+            Output of :meth:`analyze_hierarchical_method` (primary).
+        kmeans_results : list
+            Output of :meth:`analyze_fresh_method` (secondary K-Means).
         total_pigment_pixels : int
             Total number of pigmented pixels analysed.
         canvas_size : int
-            Side length of the normalised canvas (default 1000).  Used to
-            compute ``area_normalized_pct`` for each detected colour:
-            ``count / (canvas_size ** 2) * 100``.
+            Side length of the normalised canvas (default 1000).
         """
         LAB_MATCH_THRESH = _LAB_MATCH_THRESHOLD
         total_canvas_pixels = canvas_size * canvas_size
@@ -1117,13 +1348,14 @@ class SelfLearningAnalyzer:
 
         combined = []
 
-        if not trained_results:
-            # Only fresh method available
+        if not hier_results:
+            # Only K-Means method available (no trained model)
             for rank, r in enumerate(
-                sorted(fresh_results, key=lambda x: x["count"], reverse=True), 1
+                sorted(kmeans_results, key=lambda x: x["count"], reverse=True), 1
             ):
                 pct = r["count"] / max(total_pigment_pixels, 1) * 100.0
                 area_pct = r["count"] / max(total_canvas_pixels, 1) * 100.0
+                conf_k = r.get("confidence_kmeans") or r.get("confidence_fresh")
                 combined.append({
                     "rank": rank,
                     "role": "BASE" if rank == 1 else "SECONDARY",
@@ -1133,73 +1365,76 @@ class SelfLearningAnalyzer:
                     "count": r["count"],
                     "pct_of_pigment": round(pct, 2),
                     "area_normalized_pct": round(area_pct, 2),
-                    "confidence_trained": None,
-                    "confidence_fresh": r.get("confidence_fresh"),
-                    "combined_confidence": r.get("confidence_fresh"),
+                    "confidence_hierarchical": None,
+                    "confidence_kmeans": conf_k,
+                    "combined_confidence": conf_k,
                     "distance_to_centroid_lab": r.get("distance_to_centroid_lab"),
                     "moe_lab": r.get("moe_lab"),
                     "moe_rgb_pct": r.get("moe_rgb_pct"),
-                    "higher_confidence_method": "Fresh",
-                    "suggested_method": "Fresh",
+                    "higher_confidence_method": "K-Means",
+                    "suggested_method": "K-Means",
+                    "primary_method": "K-Means (no trained model)",
                 })
             return combined
 
-        # Match trained results to fresh results
-        used_fresh = [False] * len(fresh_results)
+        # Match hierarchical (primary) results to K-Means (secondary) results
+        used_km = [False] * len(kmeans_results)
         rows = []
-        for tr in trained_results:
-            tr_lab = _to_lab(tr)
+        for hr in hier_results:
+            hr_lab = _to_lab(hr)
             best_idx, best_dist = -1, LAB_MATCH_THRESH
-            for fi, fr in enumerate(fresh_results):
-                if used_fresh[fi]:
+            for fi, fr in enumerate(kmeans_results):
+                if used_km[fi]:
                     continue
-                dist = float(np.linalg.norm(_to_lab(fr) - tr_lab))
+                dist = float(np.linalg.norm(_to_lab(fr) - hr_lab))
                 if dist < best_dist:
                     best_dist = dist
                     best_idx = fi
 
-            fr = fresh_results[best_idx] if best_idx >= 0 else None
+            fr = kmeans_results[best_idx] if best_idx >= 0 else None
             if fr is not None:
-                used_fresh[best_idx] = True
+                used_km[best_idx] = True
 
-            conf_trained = tr.get("confidence_trained") or 0.0
-            conf_fresh = fr.get("confidence_fresh") or 0.0 if fr else 0.0
-            combined_conf = (conf_trained + conf_fresh) / 2.0 if fr else conf_trained
+            conf_hier = hr.get("confidence_hierarchical") or hr.get("confidence_trained") or 0.0
+            conf_km = fr.get("confidence_kmeans") or fr.get("confidence_fresh") or 0.0 if fr else 0.0
+            combined_conf = (conf_hier + conf_km) / 2.0 if fr else conf_hier
 
-            count = (tr["count"] + fr["count"]) // 2 if fr else tr["count"]
-            higher_method = "Trained" if conf_trained >= conf_fresh else "Fresh"
+            count = (hr["count"] + fr["count"]) // 2 if fr else hr["count"]
+            higher_method = "Hierarchical" if conf_hier >= conf_km else "K-Means"
             rows.append({
-                "center_rgb": tr["center_rgb"],
-                "name": tr["name"],
-                "hex": tr["hex"],
+                "center_rgb": hr["center_rgb"],
+                "name": hr["name"],
+                "hex": hr["hex"],
                 "count": count,
-                "confidence_trained": round(conf_trained, 1),
-                "confidence_fresh": round(conf_fresh, 1) if fr else None,
+                "confidence_hierarchical": round(conf_hier, 1),
+                "confidence_kmeans": round(conf_km, 1) if fr else None,
                 "combined_confidence": round(combined_conf, 1),
-                "distance_to_centroid_lab": tr.get("distance_to_centroid_lab"),
-                "moe_lab": tr.get("moe_lab"),
-                "moe_rgb_pct": tr.get("moe_rgb_pct"),
+                "distance_to_centroid_lab": hr.get("distance_to_centroid_lab"),
+                "moe_lab": hr.get("moe_lab"),
+                "moe_rgb_pct": hr.get("moe_rgb_pct"),
                 "higher_confidence_method": higher_method,
                 "suggested_method": higher_method,
+                "primary_method": "Hierarchical",
             })
 
-        # Add unmatched fresh results
-        for fi, fr in enumerate(fresh_results):
-            if not used_fresh[fi]:
-                conf_fresh = fr.get("confidence_fresh") or 0.0
+        # Add unmatched K-Means results
+        for fi, fr in enumerate(kmeans_results):
+            if not used_km[fi]:
+                conf_km = fr.get("confidence_kmeans") or fr.get("confidence_fresh") or 0.0
                 rows.append({
                     "center_rgb": fr["center_rgb"],
                     "name": fr["name"],
                     "hex": fr["hex"],
                     "count": fr["count"],
-                    "confidence_trained": None,
-                    "confidence_fresh": round(conf_fresh, 1),
-                    "combined_confidence": round(conf_fresh, 1),
+                    "confidence_hierarchical": None,
+                    "confidence_kmeans": round(conf_km, 1),
+                    "combined_confidence": round(conf_km, 1),
                     "distance_to_centroid_lab": fr.get("distance_to_centroid_lab"),
                     "moe_lab": fr.get("moe_lab"),
                     "moe_rgb_pct": fr.get("moe_rgb_pct"),
-                    "higher_confidence_method": "Fresh",
-                    "suggested_method": "Fresh",
+                    "higher_confidence_method": "K-Means",
+                    "suggested_method": "K-Means",
+                    "primary_method": "Hierarchical",
                 })
 
         # Sort by count descending, assign rank and area metrics
@@ -1221,12 +1456,12 @@ def print_color_table(colors):
     """Print formatted color result table to console."""
     if not colors:
         return
-    sep = "=" * 122
+    sep = "=" * 130
     print(f"\n{sep}")
     print(
         f"  {'RNK':<4} {'ROLE':<10} {'COLOR NAME':<22} {'HEX':<9} "
-        f"{'%PIGm':>6} {'AREA%':>6} {'CONF-T':>7} {'CONF-F':>7} {'COMB':>6} "
-        f"{'DIST-dE':>8} {'MoE-dE':>7} {'MoE-RGB%':>9} {'HIGHER METHOD'}"
+        f"{'%PIGm':>6} {'AREA%':>6} {'CONF-H':>7} {'CONF-K':>7} {'COMB':>6} "
+        f"{'DIST-dE':>8} {'MoE-dE':>7} {'MoE-RGB%':>9} {'BETTER METHOD':<18} {'PRIMARY'}"
     )
     print(sep)
     for c in colors:
@@ -1236,13 +1471,14 @@ def print_color_table(colors):
             f"  {c['rank']:<4} {c['role']:<10} {c['name']:<22} {c['hex']:<9} "
             f"{c['pct_of_pigment']:>5.1f}% "
             f"{_f(c.get('area_normalized_pct')):>6} "
-            f"{_f(c.get('confidence_trained')):>7} "
-            f"{_f(c.get('confidence_fresh')):>7} "
+            f"{_f(c.get('confidence_hierarchical')):>7} "
+            f"{_f(c.get('confidence_kmeans')):>7} "
             f"{_f(c.get('combined_confidence')):>6} "
             f"{_f(c.get('distance_to_centroid_lab')):>8} "
             f"{_f(c.get('moe_lab')):>7} "
             f"{_f(c.get('moe_rgb_pct')):>9} "
-            f"{c.get('higher_confidence_method', 'N/A')}"
+            f"{c.get('higher_confidence_method', 'N/A'):<18} "
+            f"{c.get('primary_method', 'Hierarchical')}"
         )
     print(sep)
 
@@ -1254,9 +1490,9 @@ def export_results(combined_colors, output_folder, timestamp):
     fieldnames = [
         "rank", "role", "name", "hex", "rgb",
         "pct_of_pigment", "area_normalized_pct",
-        "confidence_trained", "confidence_fresh", "combined_confidence",
+        "confidence_hierarchical", "confidence_kmeans", "combined_confidence",
         "distance_to_centroid_lab", "moe_lab", "moe_rgb_pct",
-        "higher_confidence_method", "suggested_method",
+        "higher_confidence_method", "suggested_method", "primary_method",
     ]
 
     csv_path = os.path.join(output_folder, f"results_combined_{timestamp}.csv")
@@ -1310,33 +1546,33 @@ def plot_training_infographic(model, sample_results, output_folder, timestamp):
     gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.35,
                            top=0.92, bottom=0.06, left=0.06, right=0.97)
 
-    # 1. K values per sample (bar chart)
+    # 1. Colors discovered per sample (Hierarchical primary)
     ax1 = fig.add_subplot(gs[0, :2])
-    k_vals = [sr["optimal_k"] for sr in sample_results]
+    n_colors_list = [sr.get("n_colors", sr.get("optimal_k", 0)) for sr in sample_results]
     fnames = [os.path.basename(sr["file"])[:15] for sr in sample_results]
-    bar_colors = plt.cm.plasma(np.linspace(0.2, 0.9, len(k_vals)))
-    bars = ax1.bar(range(len(k_vals)), k_vals, color=bar_colors, edgecolor="#444444")
-    ax1.set_xticks(range(len(k_vals)))
+    bar_colors = plt.cm.plasma(np.linspace(0.2, 0.9, len(n_colors_list)))
+    bars = ax1.bar(range(len(n_colors_list)), n_colors_list, color=bar_colors, edgecolor="#444444")
+    ax1.set_xticks(range(len(n_colors_list)))
     ax1.set_xticklabels(fnames, rotation=45, ha="right", **label_kw)
-    ax1.set_ylabel("Optimal K", **label_kw)
-    ax1.set_title("Optimal K Found per Training Sample", **title_kw)
+    ax1.set_ylabel("Colors Discovered", **label_kw)
+    ax1.set_title("Colors Discovered per Training Sample (Hierarchical)", **title_kw)
     ax1.set_facecolor(panel_bg)
     ax1.tick_params(**tick_kw)
-    mean_k = float(np.mean(k_vals)) if k_vals else 0
-    ax1.axhline(y=mean_k, color="#ff6b6b", linestyle="--",
-                linewidth=1.5, label=f"Mean K={mean_k:.1f}")
+    mean_n = getattr(model, "mean_colors", float(np.mean(n_colors_list)) if n_colors_list else 0)
+    ax1.axhline(y=mean_n, color="#ff6b6b", linestyle="--",
+                linewidth=1.5, label=f"Mean={mean_n:.1f}")
     ax1.legend(fontsize=8, facecolor=panel_bg, labelcolor="white")
-    for bar, kv in zip(bars, k_vals):
+    for bar, nv in zip(bars, n_colors_list):
         ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
-                 str(kv), ha="center", va="bottom", color="white", fontsize=8)
+                 str(nv), ha="center", va="bottom", color="white", fontsize=8)
 
-    # 2. K distribution histogram
+    # 2. Color count distribution histogram
     ax2 = fig.add_subplot(gs[0, 2])
-    ax2.hist(k_vals, bins=max(3, len(set(k_vals))), color="#e94560",
+    ax2.hist(n_colors_list, bins=max(3, len(set(n_colors_list))), color="#e94560",
              edgecolor=panel_bg, alpha=0.85)
-    ax2.set_xlabel("Optimal K", **label_kw)
+    ax2.set_xlabel("Colors Discovered", **label_kw)
     ax2.set_ylabel("Frequency", **label_kw)
-    ax2.set_title("K Distribution\nacross Samples", **title_kw)
+    ax2.set_title("Color Count Distribution\n(Hierarchical)", **title_kw)
     ax2.set_facecolor(panel_bg)
     ax2.tick_params(**tick_kw)
 
@@ -1387,26 +1623,33 @@ def plot_training_infographic(model, sample_results, output_folder, timestamp):
     ax5 = fig.add_subplot(gs[2, :2])
     ax5.set_facecolor(panel_bg)
     ax5.axis("off")
+    linkage_m = getattr(model, "linkage_method", "ward")
+    min_c = getattr(model, "min_colors", model.k_min)
+    max_c = getattr(model, "max_colors", model.k_max)
+    mean_c = getattr(model, "mean_colors", None)
+    median_c = getattr(model, "median_colors", None)
     summary_lines = [
         ("Training Samples", str(model.n_training_samples)),
-        ("K Values Discovered", str(model.k_values_found)),
-        ("Learned K_MIN", str(model.k_min)),
-        ("Learned K_MAX", str(model.k_max)),
+        ("Linkage Method (Primary)", linkage_m),
+        ("Hierarchical Percentile", str(model.hierarchical_percentile)),
+        ("Min Colors Discovered", str(min_c)),
+        ("Max Colors Discovered", str(max_c)),
+        ("Mean Colors Discovered", f"{mean_c:.1f}" if mean_c is not None else "N/A"),
+        ("Median Colors Discovered", f"{median_c:.1f}" if median_c is not None else "N/A"),
         ("Merge Percentile", str(model.merge_percentile)),
         ("Merge Threshold (dE)", f"{model.merge_threshold:.2f}" if model.merge_threshold else "N/A"),
-        ("Hierarchical Percentile", str(model.hierarchical_percentile)),
         ("Confidence Scale (dE)", f"{model.confidence_scale:.2f}"),
         ("Training Accuracy", f"{model.training_accuracy:.1f}%" if model.training_accuracy is not None else "N/A"),
         ("Consistency Score", f"{model.consistency_score:.1f}/100" if model.consistency_score is not None else "N/A"),
         ("Training Date", str(model.training_date)[:19] if model.training_date else "N/A"),
     ]
     for row_idx, (label, value) in enumerate(summary_lines):
-        y = 0.95 - row_idx * 0.082
+        y = 0.95 - row_idx * 0.07
         ax5.text(0.02, y, label + ":", transform=ax5.transAxes,
                  color="#aaaaaa", fontsize=9, va="top")
-        ax5.text(0.35, y, value, transform=ax5.transAxes,
+        ax5.text(0.42, y, value, transform=ax5.transAxes,
                  color="#f0f0f0", fontsize=9, va="top", fontweight="bold")
-    ax5.set_title("Parameter Summary", **title_kw)
+    ax5.set_title("Parameter Summary (Hierarchical Primary)", **title_kw)
 
     # 6. Validation gauge
     ax6 = fig.add_subplot(gs[2, 2])
@@ -1428,7 +1671,7 @@ def plot_training_infographic(model, sample_results, output_folder, timestamp):
                  f"{val:.1f}%", va="center", color="white", fontsize=9)
 
     fig.suptitle(
-        "Shell Color Analysis - Training Summary Report",
+        "Shell Color Analysis - Training Summary Report (Hierarchical Primary)",
         fontsize=16, fontweight="bold", color="white", y=0.97
     )
 
@@ -1487,8 +1730,8 @@ def plot_analysis_dashboard(
     # Row 1: Multi-method comparison (3 pie charts)
     compare_gs = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=outer_gs[1], wspace=0.3)
     pie_datasets = [
-        ("Method 1\n(Trained)", trained_colors_pie),
-        ("Method 2\n(Fresh)", fresh_colors_pie),
+        ("Method 1\n(Hierarchical Primary)", trained_colors_pie),
+        ("Method 2\n(K-Means Secondary)", fresh_colors_pie),
         ("Combined\nResult", combined_colors),
     ]
     for col_idx, (label, color_list) in enumerate(pie_datasets):
@@ -1513,19 +1756,22 @@ def plot_analysis_dashboard(
 
     ax_hist = fig.add_subplot(row2_gs[0])
     ax_hist.set_facecolor(panel_bg)
-    conf_t = [c["confidence_trained"] for c in combined_colors if c.get("confidence_trained") is not None]
-    conf_f = [c["confidence_fresh"] for c in combined_colors if c.get("confidence_fresh") is not None]
-    conf_c = [c["combined_confidence"] for c in combined_colors if c.get("combined_confidence") is not None]
+    conf_h = [c["confidence_hierarchical"] for c in combined_colors
+              if c.get("confidence_hierarchical") is not None]
+    conf_k = [c["confidence_kmeans"] for c in combined_colors
+              if c.get("confidence_kmeans") is not None]
+    conf_c = [c["combined_confidence"] for c in combined_colors
+              if c.get("combined_confidence") is not None]
     bins = np.linspace(0, 100, 21)
-    if conf_t:
-        ax_hist.hist(conf_t, bins=bins, alpha=0.7, color="#e94560", label="Trained")
-    if conf_f:
-        ax_hist.hist(conf_f, bins=bins, alpha=0.7, color="#00b4d8", label="Fresh")
+    if conf_h:
+        ax_hist.hist(conf_h, bins=bins, alpha=0.7, color="#e94560", label="Hierarchical (Primary)")
+    if conf_k:
+        ax_hist.hist(conf_k, bins=bins, alpha=0.7, color="#00b4d8", label="K-Means (Secondary)")
     if conf_c:
         ax_hist.hist(conf_c, bins=bins, alpha=0.7, color="#90e0ef", label="Combined")
     ax_hist.set_xlabel("Confidence (%)", **label_kw)
     ax_hist.set_ylabel("Count", **label_kw)
-    ax_hist.set_title("Confidence Score Distribution", **title_kw)
+    ax_hist.set_title("Confidence Score Distribution\n(Hierarchical Primary)", **title_kw)
     ax_hist.legend(fontsize=8, facecolor=panel_bg, labelcolor="white")
     ax_hist.tick_params(**tick_kw)
     ax_hist.grid(True, color="#333355", linewidth=0.5, alpha=0.5)
@@ -1558,8 +1804,8 @@ def plot_analysis_dashboard(
     ax_lab.tick_params(**tick_kw)
     ax_lab.grid(True, color="#333355", linewidth=0.5, alpha=0.5)
 
-    # Row 3 (optional): K-optimization curves
-    if k_metrics:
+    # Row 3 (optional): K-Means secondary metrics
+    if k_metrics and k_metrics.get("k_values"):
         row3_gs = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=outer_gs[3], wspace=0.35)
         k_vals = k_metrics["k_values"]
         curve_data = [
@@ -1573,15 +1819,16 @@ def plot_analysis_dashboard(
             ax.plot(k_vals, scores, "-o", color=color, linewidth=2, markersize=5)
             ax.axvline(x=k_metrics["optimal_k"], color="#f0c040",
                        linestyle="--", linewidth=1.5,
-                       label=f"Optimal K={k_metrics['optimal_k']}")
-            ax.set_title(ctitle, **title_kw)
+                       label=f"K={k_metrics['optimal_k']} (secondary)")
+            ax.set_title(ctitle + "\n[K-Means Secondary]", **title_kw)
             ax.set_xlabel("Number of Clusters K", **label_kw)
             ax.legend(fontsize=7, facecolor=panel_bg, labelcolor="white")
             ax.tick_params(**tick_kw)
             ax.grid(True, color="#333355", linewidth=0.5, alpha=0.5)
 
     fig.suptitle(
-        "Shell Color Analysis - Multi-Method Dashboard",
+        "Shell Color Analysis - Multi-Method Dashboard\n"
+        "(Hierarchical Primary  |  K-Means Secondary)",
         fontsize=15, fontweight="bold", color="white", y=0.98
     )
 
@@ -1739,21 +1986,23 @@ def run_analysis_mode(folder_path, config, model=None, output_folder="./output",
 
     logger.info("\n--- Running Self-Learning Analysis ---")
 
-    # Method 1 (Trained)
-    trained_results = []
-    if model is not None:
-        logger.info("\n  [Method 1] Trained centroid matching...")
-        trained_results = analyzer.analyze_trained_method(pixel_stack)
+    # Method 1 (Hierarchical Primary)
+    hier_results = []
+    linkage_matrix = None
+    h_sample = None
+    logger.info("\n  [Method 1 - Hierarchical PRIMARY] Hierarchical clustering...")
+    hier_out = analyzer.analyze_hierarchical_method(pixel_stack)
+    hier_results, linkage_matrix, h_sample = hier_out
 
-    # Method 2 (Fresh)
-    logger.info("\n  [Method 2] Fresh clustering with trained parameters...")
+    # Method 2 (K-Means Secondary)
+    logger.info("\n  [Method 2 - K-Means SECONDARY] K-Means comparison...")
     fresh_out = analyzer.analyze_fresh_method(pixel_stack)
-    fresh_results, k_metrics, linkage_matrix, h_cut_height, h_sample = fresh_out
+    fresh_results, k_metrics = fresh_out
 
     total_pix = len(pixel_stack)
 
     # Build display-ready color lists (add pct_of_pigment)
-    def _enrich(result_list, conf_key):
+    def _enrich(result_list):
         enriched = []
         for rank, r in enumerate(
             sorted(result_list, key=lambda x: x["count"], reverse=True), 1
@@ -1764,12 +2013,12 @@ def run_analysis_mode(folder_path, config, model=None, output_folder="./output",
             enriched.append(r2)
         return enriched
 
-    trained_colors_pie = _enrich(trained_results, "confidence_trained")
-    fresh_colors_pie = _enrich(fresh_results, "confidence_fresh")
+    hier_colors_pie = _enrich(hier_results)
+    fresh_colors_pie = _enrich(fresh_results)
 
-    # Combined results
+    # Combined results (hierarchical primary + K-Means secondary)
     combined = analyzer.combine_results(
-        trained_results, fresh_results, total_pix,
+        hier_results, fresh_results, total_pix,
         canvas_size=config.get("STANDARD_CANVAS_SIZE", 1000),
     )
 
@@ -1787,7 +2036,7 @@ def run_analysis_mode(folder_path, config, model=None, output_folder="./output",
     if config.get("SAVE_FIGURES", True):
         fig_dash = plot_analysis_dashboard(
             combined_colors=combined,
-            trained_colors_pie=trained_colors_pie,
+            trained_colors_pie=hier_colors_pie,
             fresh_colors_pie=fresh_colors_pie,
             processed_images=gallery,
             model=model,
@@ -1808,7 +2057,7 @@ def run_analysis_mode(folder_path, config, model=None, output_folder="./output",
         plt.show()
 
     logger.info("Analysis complete.")
-    return {"combined": combined, "trained": trained_results, "fresh": fresh_results}
+    return {"combined": combined, "hierarchical": hier_results, "kmeans": fresh_results}
 
 
 # ============================================================
