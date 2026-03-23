@@ -1,4 +1,1 @@
-        sil_str = ... # your calculation here
-def logger_info():
-    ...
-            logger.info(f"The calculated diversity string is: {sil_str}")
+    print(f"Color: {color} | Brightness: {brightness:.2f}" if brightness >= 0 else f"Color: {color} | Brightness: Not Available")
