@@ -796,10 +796,10 @@ def _collect_training_centroids(folder_path, config, existing_colors=None):
         for mp in merge_pct_candidates:
             thresh = compute_adaptive_merge_threshold(h_centers, mp)
             merged_c, _ = merge_similar_clusters(h_centers, h_counts, thresh)
-            # Prefer merge threshold that preserves all natural groups
-            score = abs(len(merged_c) - best_n_colors)
-            if score < best_mp_score:
-                best_mp_score = score
+            # Prefer merge threshold that best preserves all natural color groups
+            deviation = abs(len(merged_c) - best_n_colors)
+            if deviation < best_mp_score:
+                best_mp_score = deviation
                 best_mp = mp
                 best_thresh = thresh
         final_centers, final_counts = merge_similar_clusters(h_centers, h_counts, best_thresh)
@@ -1188,11 +1188,15 @@ class SelfLearningAnalyzer:
             sample_size = min(3000, len(pixel_stack))
             idx = np.random.RandomState(42).choice(len(pixel_stack), sample_size, replace=False)
             sil_samples = silhouette_samples(all_labs[idx], full_labels[idx])
-            per_cluster_sil = np.array([
-                float(sil_samples[full_labels[idx] == k].mean())
-                if (full_labels[idx] == k).any() else 0.0
-                for k in range(n_clusters)
-            ])
+            per_cluster_sil = []
+            for k in range(n_clusters):
+                mask_k = full_labels[idx] == k
+                if mask_k.any():
+                    val = float(np.nanmean(sil_samples[mask_k]))
+                    per_cluster_sil.append(0.0 if np.isnan(val) else val)
+                else:
+                    per_cluster_sil.append(0.0)
+            per_cluster_sil = np.array(per_cluster_sil)
         else:
             per_cluster_sil = np.zeros(n_clusters)
 
