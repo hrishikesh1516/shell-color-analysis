@@ -110,29 +110,145 @@ _LAB_MATCH_THRESHOLD = 30.0
 
 
 # ============================================================
-# COLOR DICTIONARY (XKCD 949 colors -> CIELAB)
+# COLOR DICTIONARY (CSS named colors -> CIELAB)
 # ============================================================
 def build_color_dictionary():
-    """Build a LAB-space dictionary from the XKCD 949-color set."""
-    logger.info("Loading perceptual color dictionary (949 XKCD colors)...")
+    """Build a LAB-space dictionary from CSS/HTML named colors (primary) plus XKCD (secondary)."""
+    logger.info("Loading perceptual color dictionary (CSS + XKCD colors)...")
     color_dict_lab = {}
+
+    # Secondary: XKCD colors (loaded first so CSS names take precedence on collision)
     for name, hex_val in mcolors.XKCD_COLORS.items():
         clean_name = name.replace("xkcd:", "").title()
         rgb_float = mcolors.hex2color(hex_val)
         rgb_255 = np.uint8([[[int(c * 255) for c in rgb_float]]])
         lab_val = cv2.cvtColor(rgb_255, cv2.COLOR_RGB2LAB)[0][0]
         color_dict_lab[clean_name] = lab_val
+
+    # Primary: CSS/HTML named colors (overwrite any XKCD collision; more standardised)
+    for name, hex_val in mcolors.CSS4_COLORS.items():
+        clean_name = name.replace("-", " ").title()
+        rgb_float = mcolors.hex2color(hex_val)
+        rgb_255 = np.uint8([[[int(c * 255) for c in rgb_float]]])
+        lab_val = cv2.cvtColor(rgb_255, cv2.COLOR_RGB2LAB)[0][0]
+        color_dict_lab[clean_name] = lab_val
+
     logger.info(f"  Loaded {len(color_dict_lab)} named colors.")
     return color_dict_lab
 
 
 COLOR_DICT_LAB = build_color_dictionary()
 
+# Delta-E threshold below which a CSS/named-color match is considered "good".
+_COLOR_NAME_GOOD_MATCH_THRESHOLD = 25.0
+
+
+def _hsl_descriptive_name(r, g, b):
+    """Generate a human-readable name from HSL properties when no close named match exists.
+
+    Returns a string like "Light Purple", "Dark Muted Green", "Vivid Cyan", etc.
+    """
+    # Convert RGB [0-255] -> HSL [H: 0-360, S: 0-1, L: 0-1]
+    r_f, g_f, b_f = r / 255.0, g / 255.0, b / 255.0
+    c_max = max(r_f, g_f, b_f)
+    c_min = min(r_f, g_f, b_f)
+    delta = c_max - c_min
+
+    # Lightness
+    lightness = (c_max + c_min) / 2.0
+
+    # Saturation (guard against division by zero at L=0 or L=1)
+    denom = 1 - abs(2 * lightness - 1)
+    saturation = 0.0 if delta == 0 or denom == 0 else delta / denom
+
+    # Hue
+    if delta == 0:
+        hue = 0.0
+    elif c_max == r_f:
+        hue = 60.0 * (((g_f - b_f) / delta) % 6)
+    elif c_max == g_f:
+        hue = 60.0 * (((b_f - r_f) / delta) + 2)
+    else:
+        hue = 60.0 * (((r_f - g_f) / delta) + 4)
+
+    # --- Lightness descriptor ---
+    if lightness < 0.15:
+        light_desc = "Very Dark"
+    elif lightness < 0.30:
+        light_desc = "Dark"
+    elif lightness < 0.55:
+        light_desc = "Medium"
+    elif lightness < 0.75:
+        light_desc = "Light"
+    else:
+        light_desc = "Very Light"
+
+    # --- Saturation descriptor ---
+    if saturation < 0.10:
+        sat_desc = "Grey"
+        # For nearly-grey colours just return a lightness+grey label
+        if lightness < 0.20:
+            return "Very Dark Grey"
+        elif lightness < 0.40:
+            return "Dark Grey"
+        elif lightness < 0.60:
+            return "Grey"
+        elif lightness < 0.80:
+            return "Light Grey"
+        else:
+            return "White"
+    elif saturation < 0.25:
+        sat_desc = "Grayish"
+    elif saturation < 0.50:
+        sat_desc = "Muted"
+    elif saturation < 0.75:
+        sat_desc = "Bright"
+    else:
+        sat_desc = "Vivid"
+
+    # --- Hue descriptor ---
+    if hue < 15 or hue >= 345:
+        hue_desc = "Red"
+    elif hue < 40:
+        hue_desc = "Orange"
+    elif hue < 70:
+        hue_desc = "Yellow"
+    elif hue < 150:
+        hue_desc = "Green"
+    elif hue < 195:
+        hue_desc = "Cyan"
+    elif hue < 255:
+        hue_desc = "Blue"
+    elif hue < 285:
+        hue_desc = "Purple"
+    elif hue < 315:
+        hue_desc = "Magenta"
+    else:
+        hue_desc = "Pink"
+
+    # Combine: "<Lightness> <Hue>" for medium/neutral saturation,
+    # "<Lightness> <Sat> <Hue>" for vivid/muted colours.
+    if sat_desc == "Grayish":
+        return f"{light_desc} {hue_desc} Grey"
+    elif light_desc == "Medium":
+        return f"{sat_desc} {hue_desc}"
+    else:
+        return f"{light_desc} {hue_desc}"
+
 
 def get_closest_color_name(rgb_tuple):
-    """Match an RGB color to the closest XKCD name via CIELAB perceptual distance."""
-    rgb_255 = np.uint8([[[int(rgb_tuple[0]), int(rgb_tuple[1]), int(rgb_tuple[2])]]])
+    """Return a human-readable name for an RGB color.
+
+    Strategy (in order):
+    1. Find the closest CSS/named color in CIELAB space.
+    2. If the best match is within *_COLOR_NAME_GOOD_MATCH_THRESHOLD* deltaE units,
+       return that CSS name.
+    3. Otherwise fall back to an HSL-derived descriptive name (e.g. "Light Purple").
+    """
+    r, g, b = int(rgb_tuple[0]), int(rgb_tuple[1]), int(rgb_tuple[2])
+    rgb_255 = np.uint8([[[r, g, b]]])
     target_lab = cv2.cvtColor(rgb_255, cv2.COLOR_RGB2LAB)[0][0].astype(float)
+
     min_dist = float("inf")
     best_name = "Unknown"
     for name, lab_val in COLOR_DICT_LAB.items():
@@ -140,7 +256,12 @@ def get_closest_color_name(rgb_tuple):
         if dist < min_dist:
             min_dist = dist
             best_name = name
-    return best_name
+
+    if min_dist <= _COLOR_NAME_GOOD_MATCH_THRESHOLD:
+        return best_name
+
+    # No close named-color match – generate a descriptive HSL name
+    return _hsl_descriptive_name(r, g, b)
 
 
 # ============================================================
